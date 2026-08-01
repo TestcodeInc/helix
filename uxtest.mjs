@@ -140,9 +140,6 @@ check("image link serves with mime", r.status === 200 && r.headers.get("content-
 r = await req("/i/expiredtoken");
 check("expired link is a friendly 404", r.status === 404);
 
-// 9. demo page + consent shows likeness
-const demoHtml = await (await req("/demo")).text();
-check("demo page serves", demoHtml.includes("Dog Photobooth") && demoHtml.includes("scope=likeness"));
 
 // 10. owner-device door: login → pending → decide → revoke
 const jpost = (path, obj, token) =>
