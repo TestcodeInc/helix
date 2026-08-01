@@ -1,0 +1,69 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "helix-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["HelixMCP"]
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "HelixMCP",
+        "name": "MCP_OBJECT"
+      }
+    ]
+  },
+  "routes": [
+    {
+      "pattern": "vault.helix.ai",
+      "custom_domain": true
+    }
+  ],
+  // Keep the workers.dev URL alive — every pre-domain connection
+  // (ChatGPT, Claude, beta users) still points at it.
+  "workers_dev": true,
+  "preview_urls": true,
+  "vars": {
+    "PUBLIC_ORIGIN": "https://vault.helix.ai",
+    // Free-tier generation caps per user per month. "-1" = unlimited.
+    // Per-user overrides are set in KV (limits:<userId>).
+    "FREE_IMAGES_PER_MONTH": "20",
+    "FREE_SPEECH_PER_MONTH": "20",
+    // Verified Resend sending domain. Make sure this address is a real
+    // alias so replies reach a human.
+    "EMAIL_FROM": "Helix <hello@helix.ai>",
+    // iOS push: bundle id of the HelixVault app; env "sandbox" for Xcode
+    // builds, "production" for TestFlight/App Store.
+    "APNS_BUNDLE_ID": "de.testco.helix",
+    "APNS_ENV": "sandbox",
+    "TURNSTILE_SITE_KEY": "0x4AAAAAAED5z4U5pCNvZXab"
+  },
+  // Nightly vault backup — 07:10 UTC (early morning US eastern).
+  "triggers": {
+    "crons": ["10 7 * * *"]
+  },
+  "r2_buckets": [
+    {
+      "binding": "BACKUPS",
+      "bucket_name": "helix-storage"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "4274500211ab4fe39222de3dff9082fb"
+    },
+    {
+      "binding": "VAULT_KV",
+      "id": "20337fc6f6f6440caef3fba0240b03ad"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
