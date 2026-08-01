@@ -106,10 +106,12 @@ An implementation that breaks one of these isn't Helix:
 
 ## Licence
 
-AGPL-3.0-only. Running a vault for yourself, your family or your company
-triggers no obligation. Running a *modified* Helix as a service for other
-people means those people are entitled to your modified source — which is
-the point: nobody gets to quietly remove the audit log or the consent gate
-and still call it Helix.
+Copyright © 2026 James Rhodes. Licensed under AGPL-3.0-only; see `LICENSE`.
+
+Running a vault for yourself, your family or your company triggers no
+obligation. Running a *modified* Helix as a service for other people means
+those people are entitled to your modified source — which is the point:
+nobody gets to quietly remove the audit log or the consent gate and still
+call it Helix.
 
 Spec text at `helix.ai/docs/spec` is CC BY 4.0.
