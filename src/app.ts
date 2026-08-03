@@ -26,6 +26,8 @@ import {
   listPending,
   decidePending,
   readAudit,
+  appendAudit,
+  verifyAuditChain,
   findEntry,
   entryId as entryIdOf,
 } from "./vault";
@@ -53,11 +55,22 @@ import {
   readGeneratedImage,
   type SubjectPhoto,
 } from "./subjects";
-import { loadVoice, addTakes, deleteTake, deleteVoice, VOICE_CARDS } from "./voice";
+import { loadVoice, addTakes, deleteTake, deleteVoice, VOICE_CARDS, VOICE_PROVIDER } from "./voice";
 import { limitsFor, usageFor } from "./usage";
 import { emailConfigured, sendVerification, sendReset } from "./email";
 import { rateLimit, clientId, verifyTurnstile, turnstileWidget } from "./ratelimit";
 import { runBackup } from "./backup";
+import { userActivity, activitySummary } from "./activity";
+import { checkExport, importExport, importSummary, MAX_IMPORT_BYTES } from "./importer";
+import {
+  loadLabels,
+  setLabels,
+  setPrivate,
+  relabelEntry,
+  pruneLabels,
+  labelIndex,
+  normalizeLabel,
+} from "./labels";
 import {
   createDevice,
   getDeviceByToken,
@@ -142,6 +155,16 @@ function page(title: string, body: string): string {
   .banner{background:#20222e;border:1px solid #35395a;border-radius:10px;padding:12px 16px;margin:14px 0}
   .addrow{display:flex;gap:8px;margin:10px 0 4px}
   .addrow input{margin:0;flex:1}
+  .replacer{margin:8px 0}
+  .replacer select{margin:6px 0 2px;max-width:100%}
+  .state{margin:4px 0;font-size:.9em}
+  .state--stuck{color:#f0a0b4}
+  .state--cold{color:#c9a86a}
+  .state--warm{color:#7fd6a8}
+  .chip{display:inline-block;background:#22243a;border:1px solid #34375a;color:#9aa0c8;border-radius:999px;padding:1px 8px;font-size:.72em;margin-left:6px;vertical-align:middle}
+  .chip-private{background:#2e2233;border-color:#5a3448;color:#c89ab4}
+  .labelrow{display:block;font-size:.82em;color:#8a8a94;margin:6px 0}
+  .small-input{width:auto;min-width:180px;margin:0 0 0 6px;padding:4px 8px;font-size:.9em}
   pre{background:#111116;border:1px solid #2a2a33;padding:16px;border-radius:10px;white-space:pre-wrap;font-size:.85em;line-height:1.5}
   footer{margin:48px 0 24px;padding-top:16px;border-top:1px solid #1d1d24;font-size:.82em;color:#55555e}
   footer a{color:#77777f;margin-right:12px}
@@ -184,7 +207,10 @@ const SCOPE_META: Record<string, { label: string; desc: string }> = {
   },
   "likeness:voice": {
     label: "Voice",
-    desc: "It can request speech in your verified voice and receives finished audio; your recordings are never shared.",
+    // "Never shared" was not true: the recordings reach the speech provider
+    // to build the voice. They never reach the app, which is the promise
+    // that was meant — say the accurate version of it.
+    desc: `It can request speech in your verified voice and receives finished audio. The app never receives your recordings; they go to ${VOICE_PROVIDER} to build your voice, and every request is logged.`,
   },
 };
 
@@ -641,6 +667,7 @@ ${step1}
 <div class="card"><h2 style="margin-top:0">2 · Connect your AI</h2>
 <p>Your personal Helix address:</p>
 <p><code>${esc(origin)}/mcp</code></p>
+<p class="muted">Paste that wherever an app asks for an MCP server. Step-by-step for Claude, ChatGPT, Cursor, Gemini, VS Code and others below — anything that speaks MCP works, so connect as many as you like. They all read the same vault.</p>
 ${connectApps(origin)}
 </div>
 
@@ -688,6 +715,19 @@ async function adminPage(c: Ctx, notice = ""): Promise<Response> {
     listUsers(c.env.VAULT_KV),
     listPendingInvites(c.env.VAULT_KV),
   ]);
+  // Counts and timestamps only — see activity.ts. Sorted so the people who
+  // need attention are at the top rather than buried in signup order.
+  const activity = new Map(
+    await Promise.all(
+      users.map(async (u) => [u.id, await userActivity(c.env, u.id)] as const),
+    ),
+  );
+  const rank = { stuck: 0, cold: 1, warm: 2 } as const;
+  const sorted = [...users].sort((a, b) => {
+    const sa = activitySummary(activity.get(a.id)!).state;
+    const sb = activitySummary(activity.get(b.id)!).state;
+    return rank[sa] - rank[sb] || a.createdAt.localeCompare(b.createdAt);
+  });
   const invitesHtml =
     invites.length === 0
       ? ""
@@ -717,17 +757,25 @@ ${invitesHtml}
   <button class="small ghost">Back up now</button>
 </form></div>
 <h2>Users (${users.length})</h2>
+<p class="muted">Counts and timestamps only — never vault contents. Users needing attention are listed first.</p>
 ${
-  users
-    .map(
-      (u) => `<div class="card">
+  sorted
+    .map((u) => {
+      const a = activity.get(u.id)!;
+      const s = activitySummary(a);
+      return `<div class="card">
   <p><strong>${esc(u.name)}</strong> · ${esc(u.email)} · <code>${esc(u.id)}</code> · joined ${esc(u.createdAt.slice(0, 10))}</p>
+  <p class="state state--${s.state}">${esc(s.text)}</p>
+  <p class="muted">${a.pending} pending${a.oldestPendingDays !== null ? ` (oldest ${a.oldestPendingDays}d)` : ""} · ${a.events} events · ${
+    a.lastRead ? `last read ${esc(a.lastRead.at.slice(0, 10))} by ${esc(a.lastRead.client)}` : "never read"
+  } · ${a.lastCurated ? `last curated ${esc(a.lastCurated.slice(0, 10))}` : "never curated"}</p>
+  <p class="muted">${a.labelled} labelled · ${a.private} private · ${a.devices} device${a.devices === 1 ? "" : "s"} · images ${a.images.used}/${a.images.limit < 0 ? "∞" : a.images.limit} · speech ${a.speech.used}/${a.speech.limit < 0 ? "∞" : a.speech.limit}</p>
   <div class="row">
     <form method="POST" action="/admin/reset"><input type="hidden" name="userId" value="${esc(u.id)}"><button class="small ghost">New invite link (reset passphrase)</button></form>
     <form method="POST" action="/admin/delete" onsubmit="return confirm('Delete ${esc(u.name)} and ALL their data?')"><input type="hidden" name="userId" value="${esc(u.id)}"><button class="small ghost">Delete user + data</button></form>
   </div>
-</div>`,
-    )
+</div>`;
+    })
     .join("") || `<p class="muted">None yet.</p>`
 }`,
     ),
@@ -850,6 +898,29 @@ ${ordered.filter((s) => !requested.has(s)).map((s) => box(s, false)).join("")}
 <p class="muted">This app didn't say what it needs, so nothing about likeness is pre-selected.</p>
 ${ordered.map((s) => box(s, DEFAULT_SCOPES.has(s))).join("")}`;
 
+  // Label narrowing. Only offered when we already know who's signing in —
+  // before that we can't know which labels exist. An unrestricted grant is
+  // the default, so saying nothing here changes nothing.
+  let labelBlock = "";
+  if (user) {
+    const [vault, labelDoc] = await Promise.all([
+      loadVault(c.env.VAULT_KV, user.id, { name: user.name, email: user.email }),
+      loadLabels(c.env.VAULT_KV, user.id),
+    ]);
+    const index = labelIndex(vault, labelDoc, [...CATEGORIES]);
+    if (index.length) {
+      labelBlock = `<details style="margin-top:14px"><summary class="muted">Limit this app to certain labels</summary>
+<p class="muted">Pick one or more and this app sees <em>only</em> entries carrying them — inside the categories above, never beyond. Anything you haven't labelled becomes invisible to it, which is usually the point.</p>
+${index
+  .map(
+    (l) =>
+      `<label class="scope"><input type="checkbox" name="labels" value="${esc(l.label)}"> <strong>${esc(l.label)}</strong> <span class="muted">${l.count} ${l.count === 1 ? "entry" : "entries"}</span></label>`,
+  )
+  .join("")}
+</details>`;
+    }
+  }
+
   const identityBlock = user
     ? `<p class="muted">Signed in as ${esc(user.name)} (${esc(user.email)})</p>
        <label>Confirm passphrase</label><input type="password" name="passphrase" required>`
@@ -868,6 +939,7 @@ ${ordered.map((s) => box(s, DEFAULT_SCOPES.has(s))).join("")}`;
     <input type="hidden" name="client_name" value="${esc(clientName)}">
     ${user ? `<input type="hidden" name="email" value="${esc(user.email)}">` : ""}
     ${scopeBoxes}
+    ${labelBlock}
     ${identityBlock}
     <div class="row">
       <button type="submit">Approve</button>
@@ -890,13 +962,24 @@ app.post("/authorize", async (c) => {
   const oauthReq = JSON.parse(atob(form.get("oauthreq")?.toString() ?? "")) as AuthRequest;
   const clientName = form.get("client_name")?.toString() ?? "Unknown app";
   const scopes = form.getAll("scopes").map((s) => s.toString());
+  const labels = [
+    ...new Set(
+      form
+        .getAll("labels")
+        .map((s) => normalizeLabel(s.toString()))
+        .filter((l): l is string => !!l),
+    ),
+  ];
 
   const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
     request: oauthReq,
     userId: user.id,
-    metadata: { label: `${clientName} → ${user.email}` },
+    // Mirrored into metadata as well as props: props ride with the token,
+    // metadata is what /connections can read back to show the owner what
+    // they actually agreed to.
+    metadata: { label: `${clientName} → ${user.email}`, labels },
     scope: scopes,
-    props: { userId: user.id, email: user.email, clientName, scopes },
+    props: { userId: user.id, email: user.email, clientName, scopes, labels },
   });
 
   return Response.redirect(redirectTo, 302);
@@ -917,12 +1000,15 @@ app.get("/connections", async (c) => {
       ? `<p class="muted">No apps connected yet. See the <a href="/welcome">guide</a> to connect one.</p>`
       : grants
           .map((g) => {
-            const label = (g.metadata as { label?: string } | undefined)?.label ?? g.clientId;
+            const meta = g.metadata as { label?: string; labels?: string[] } | undefined;
+            const label = meta?.label ?? g.clientId;
             const appName = label.split(" → ")[0];
+            const grantLabels = meta?.labels ?? [];
             const lastRead = audit.find((a) => a.client === appName && a.action === "read");
             return `<div class="card">
   <p><strong>${esc(appName)}</strong></p>
   <p class="muted">can read: ${(g.scope ?? []).filter((s: string) => s !== "propose").map(esc).join(", ") || "nothing"}${(g.scope ?? []).includes("propose") ? " · can propose learnings" : ""}</p>
+  ${grantLabels.length ? `<p class="muted">limited to ${grantLabels.map((l) => `<span class="chip">${esc(l)}</span>`).join("")} — nothing else in those categories reaches it</p>` : ""}
   <p class="muted">${lastRead ? `last read ${esc(lastRead.at.slice(0, 16).replace("T", " "))} (${esc(lastRead.detail)})` : "no reads recorded yet"}</p>
   <form method="POST" action="/connections/revoke">
     <input type="hidden" name="grantId" value="${esc(g.id)}">
@@ -976,7 +1062,29 @@ app.get("/review", async (c) => {
   const user = await sessionUser(c);
   if (!user) return c.redirect("/login");
 
-  const pending = await listPending(c.env.VAULT_KV, user.id);
+  const [pending, vault] = await Promise.all([
+    listPending(c.env.VAULT_KV, user.id),
+    loadVault(c.env.VAULT_KV, user.id, { name: user.name, email: user.email }),
+  ]);
+
+  /** Existing entries in the same category, offered as supersession targets.
+   * A fact proposed and approved inside one conversation never gets an id the
+   * AI can see, so the AI can't ask to replace it — the owner has to be able
+   * to say so here instead. */
+  const replaceOptions = (cat: Category, already?: string) => {
+    const s = vault[cat];
+    const opts = [
+      ...s.base.map((t) => ({ id: entryIdOf(cat, "base", t), text: t })),
+      ...s.learned.map((l) => ({ id: entryIdOf(cat, "learned", l.fact), text: l.fact })),
+    ];
+    if (!opts.length || already) return "";
+    return `<details class="replacer"><summary class="muted">Replace an existing entry with this?</summary>
+  <p class="muted">Use this when the new fact corrects an old one — the old entry is removed on approval, and keeps its labels.</p>
+  <select name="replaces">
+    <option value="">Add it as a new entry</option>
+    ${opts.map((o) => `<option value="${esc(o.id)}">${esc(o.text.length > 90 ? o.text.slice(0, 90) + "…" : o.text)}</option>`).join("")}
+  </select></details>`;
+  };
 
   const pendingHtml =
     pending.length === 0
@@ -984,13 +1092,22 @@ app.get("/review", async (c) => {
       : pending
           .map(
             (p) => `<div class="card">
-  <p><strong>${esc(CATEGORY_META[p.category]?.label ?? p.category)}</strong> — ${esc(p.fact)}</p>
+  ${
+    p.kind === "labels"
+      ? `<p><strong>Tag an entry</strong> — ${(p.labels ?? []).map((l) => `<span class="chip">${esc(l)}</span>`).join("")}</p>
+  <p class="muted">on: “${esc(p.targetText ?? "")}”</p>
+  <p class="muted">Labels don't change what an entry says — they let you give one app this slice and nothing else.</p>`
+      : `<p><strong>${esc(CATEGORY_META[p.category]?.label ?? p.category)}</strong> — ${esc(p.fact)}${(p.labels ?? []).map((l) => `<span class="chip">${esc(l)}</span>`).join("")}</p>`
+  }
   ${p.replacesText ? `<p class="muted">replaces: <s>${esc(p.replacesText)}</s></p>` : ""}
   <p class="muted">proposed by ${esc(p.client)} · ${esc(p.proposedAt.slice(0, 16).replace("T", " "))}</p>
-  <form method="POST" action="/review/decide" class="row">
+  <form method="POST" action="/review/decide" onsubmit="this.dataset.sent ? event.preventDefault() : (this.dataset.sent = 1, setTimeout(() => this.querySelectorAll('button').forEach((b) => (b.disabled = true)), 0));">
     <input type="hidden" name="id" value="${p.id}">
-    <button name="action" value="approve">Approve</button>
-    <button name="action" value="reject" class="ghost">Reject</button>
+    ${p.kind === "labels" ? "" : replaceOptions(p.category, p.replaces)}
+    <div class="row">
+      <button name="action" value="approve">Approve</button>
+      <button name="action" value="reject" class="ghost">Reject</button>
+    </div>
   </form>
 </div>`,
           )
@@ -1010,6 +1127,7 @@ app.get("/audit", async (c) => {
   const user = await sessionUser(c);
   if (!user) return c.redirect("/login");
   const audit = await readAudit(c.env.VAULT_KV, user.id);
+  const chain = await verifyAuditChain(audit);
 
   const auditHtml =
     audit.length === 0
@@ -1018,15 +1136,24 @@ app.get("/audit", async (c) => {
           .slice(0, 100)
           .map(
             (a) =>
-              `<p class="muted">${esc(a.at.slice(0, 16).replace("T", " "))} · <strong>${esc(a.client)}</strong> ${a.action === "read" ? "read" : a.action === "generate" ? "generated" : a.action === "write" ? "" : "proposed"} ${esc(a.detail)}</p>`,
+              `<p class="muted">${esc(a.at.slice(0, 16).replace("T", " "))} · <strong>${esc(a.client)}</strong> ${a.action === "read" ? "read" : a.action === "generate" ? "generated" : a.action === "write" ? "" : "proposed"} ${esc(a.detail)}${a.hash ? ` <span class="chip" title="${esc(a.hash)}">#${esc(a.hash.slice(0, 8))}</span>` : ""}</p>`,
           )
           .join("");
+
+  // Say exactly what the chain proves. Overclaiming here would be the worst
+  // possible place to do it.
+  const chainBanner = !chain.checked
+    ? ""
+    : chain.ok
+      ? `<div class="banner"><strong>Chain intact.</strong> ${chain.checked} ${chain.checked === 1 ? "entry links" : "entries link"} to the one before it, so none of them has been edited or reordered since it was written. It does not prove nothing was ever deleted wholesale — see the <a href="/security">security note</a>.</div>`
+      : `<div class="banner"><strong>Chain broken at entry ${chain.brokenAt}</strong> — ${esc(chain.reason ?? "verification failed")}. Entries after that point can't be trusted. Please get in touch.</div>`;
 
   return c.html(
     page(
       "Audit — Helix",
       `${await navFor(c, user)}<h1>Audit log</h1>
 <p class="muted">Every read, proposal, write, and generation by every connected app — who did what, and when.</p>
+${chainBanner}
 ${auditHtml}`,
     ),
   );
@@ -1038,7 +1165,34 @@ app.post("/review/decide", async (c) => {
   const form = await c.req.formData();
   const id = form.get("id")?.toString() ?? "";
   const action = form.get("action")?.toString() === "approve" ? "approve" : "reject";
-  await decidePending(c.env.VAULT_KV, user.id, id, action);
+  // The owner can supersede an entry the app didn't know to replace — which
+  // is the common case, because a fact proposed and approved in the same
+  // conversation never gets an id the AI can see.
+  const replaces = form.get("replaces")?.toString();
+  if (action === "approve" && replaces) {
+    const queued = await listPending(c.env.VAULT_KV, user.id);
+    const item = queued.find((p) => p.id === id);
+    const vault = await loadVault(c.env.VAULT_KV, user.id);
+    if (item && findEntry(vault, replaces)) {
+      item.replaces = replaces;
+      await c.env.VAULT_KV.put(`pending:${user.id}`, JSON.stringify(queued));
+    }
+  }
+  const decided = await decidePending(c.env.VAULT_KV, user.id, id, action);
+  // The owner's own decisions belong in the log too. Without this, the audit
+  // trail records what apps asked for but not what was allowed — and the
+  // security page's promise that every write is logged isn't true.
+  const verb = action === "approve" ? "approved" : "rejected";
+  if (decided) {
+    await appendAudit(c.env.VAULT_KV, user.id, {
+      client: "You (web)",
+      action: "write",
+      detail:
+        decided.kind === "labels"
+          ? `${verb} labels ${(decided.labels ?? []).join(", ")} proposed by ${decided.client}`
+          : `${verb} "${decided.fact.slice(0, 80)}" proposed by ${decided.client}`,
+    });
+  }
   return c.redirect("/review");
 });
 
@@ -1051,15 +1205,21 @@ function factRow(
   index: number,
   text: string,
   source: string,
+  marks: { id: string; labels: string[]; isPrivate: boolean } = { id: "", labels: [], isPrivate: false },
 ): string {
+  const chips =
+    marks.labels.map((l) => `<span class="chip">${esc(l)}</span>`).join("") +
+    (marks.isPrivate ? `<span class="chip chip-private">private</span>` : "");
   return `<div class="fact">
   <div class="reader fact-text">
-    <div>${esc(text)}</div>
+    <div>${esc(text)}${chips ? ` ${chips}` : ""}</div>
     <div class="fact-src">${esc(source)}</div>
   </div>
   <form class="editor" method="POST" action="/vault/update">
     <input type="hidden" name="category" value="${cat}"><input type="hidden" name="list" value="${list}"><input type="hidden" name="index" value="${index}">
     <input type="text" name="text" value="${esc(text)}">
+    <label class="labelrow">Labels <input type="text" name="labels" value="${esc(marks.labels.join(", "))}" placeholder="helix, family" class="small-input"></label>
+    <label class="labelrow"><input type="checkbox" name="private" value="1"${marks.isPrivate ? " checked" : ""}> Private — never leaves the vault, whatever an app was granted</label>
     <button name="action" value="save" class="small">Save</button>
     <button name="action" value="delete" class="small danger" onclick="return confirm('Delete this entry? Apps will no longer see it.')">Delete</button>
     <button type="button" class="linkbtn" onclick="this.closest('.fact').classList.remove('editing')">Cancel</button>
@@ -1071,10 +1231,15 @@ function factRow(
 app.get("/vault", async (c) => {
   const user = await sessionUser(c);
   if (!user) return c.redirect("/login");
-  const [vault, pending] = await Promise.all([
+  const [vault, pending, labelDoc] = await Promise.all([
     loadVault(c.env.VAULT_KV, user.id, { name: user.name, email: user.email }),
     listPending(c.env.VAULT_KV, user.id),
+    loadLabels(c.env.VAULT_KV, user.id),
   ]);
+  const marksFor = (cat: Category, list: "base" | "learned", text: string) => {
+    const id = entryIdOf(cat, list, text);
+    return { id, labels: labelDoc.labels[id] ?? [], isPrivate: labelDoc.private.includes(id) };
+  };
 
   const banner =
     pending.length > 0
@@ -1106,9 +1271,11 @@ app.get("/vault", async (c) => {
     const meta = CATEGORY_META[cat];
     const s = vault[cat];
     const rows =
-      s.base.map((f, i) => factRow(cat, "base", i, f, "you")).join("") +
+      s.base.map((f, i) => factRow(cat, "base", i, f, "you", marksFor(cat, "base", f))).join("") +
       s.learned
-        .map((l, i) => factRow(cat, "learned", i, l.fact, `added by ${l.source} · ${l.date}`))
+        .map((l, i) =>
+          factRow(cat, "learned", i, l.fact, `added by ${l.source} · ${l.date}`, marksFor(cat, "learned", l.fact)),
+        )
         .join("");
     return `<h2>${esc(meta.label)}</h2><p class="hint">${esc(meta.hint)}</p>
 ${rows || `<p class="muted">Nothing here yet.</p>`}
@@ -1155,6 +1322,11 @@ app.post("/vault/add", async (c) => {
     const vault = await loadVault(c.env.VAULT_KV, user.id);
     vault[category].base.push(text);
     await saveVault(c.env.VAULT_KV, user.id, vault);
+    await appendAudit(c.env.VAULT_KV, user.id, {
+      client: "You (web)",
+      action: "write",
+      detail: `added to ${category}: "${text.slice(0, 80)}"`,
+    });
   }
   return c.redirect("/vault");
 });
@@ -1168,8 +1340,13 @@ app.post("/vault/update", async (c) => {
   const index = parseInt(form.get("index")?.toString() ?? "-1", 10);
   const action = form.get("action")?.toString();
   const text = form.get("text")?.toString().trim() ?? "";
+  const labels = (form.get("labels")?.toString() ?? "").split(",").filter((s) => s.trim());
+  const wantsPrivate = form.get("private") === "1";
   if (CATEGORIES.includes(category) && index >= 0) {
     const vault = await loadVault(c.env.VAULT_KV, user.id);
+    const current =
+      list === "base" ? vault[category].base[index] : vault[category].learned[index]?.fact;
+    const oldId = current !== undefined ? entryIdOf(category, list, current) : "";
     if (list === "base") {
       if (index < vault[category].base.length) {
         if (action === "delete") vault[category].base.splice(index, 1);
@@ -1182,6 +1359,30 @@ app.post("/vault/update", async (c) => {
       }
     }
     await saveVault(c.env.VAULT_KV, user.id, vault);
+
+    if (oldId) {
+      await appendAudit(c.env.VAULT_KV, user.id, {
+        client: "You (web)",
+        action: "write",
+        // No text on a delete: this log is append-only and hash-chained, so
+        // repeating a deleted entry here would mean deletion didn't delete.
+        detail:
+          action === "delete"
+            ? `deleted a ${category} entry`
+            : `edited a ${category} entry: "${text.slice(0, 80)}"`,
+      });
+      if (action === "delete") {
+        await pruneLabels(c.env.VAULT_KV, user.id, vault);
+      } else if (text) {
+        // Editing the text mints a new content-hash id. Carry the marks
+        // across first — otherwise fixing a typo would silently un-private
+        // the entry — then apply whatever the form just set.
+        const newId = entryIdOf(category, list, text);
+        await relabelEntry(c.env.VAULT_KV, user.id, oldId, newId);
+        await setLabels(c.env.VAULT_KV, user.id, newId, labels);
+        await setPrivate(c.env.VAULT_KV, user.id, newId, wantsPrivate);
+      }
+    }
   }
   return c.redirect("/vault");
 });
@@ -1541,6 +1742,7 @@ app.get("/security", async (c) =>
 <li>Everything is encrypted in transit, and encrypted at rest by Cloudflare.</li>
 <li>Apps authenticate with OAuth 2.1 and PKCE, and receive only the categories you check. Revocation kills their tokens immediately, mid-session.</li>
 <li>Every read, proposal, write, and generation is written to an audit log only you can see.</li>
+<li>That log is <strong>hash-chained</strong>: each entry carries the fingerprint of the one before it, so editing, reordering, or removing an entry breaks every link after it. Your audit page checks the chain each time you open it and tells you if it doesn't hold. What this proves is that the entries you can see haven't been rewritten — it does not prove that the operator never deleted a stretch of log wholesale. Self-hosting is the answer if that distinction matters to you.</li>
 <li>Owner devices (your phone) authenticate with your passphrase, not with an app scope — no third-party app can ever obtain approval powers.</li>
 </ul>
 
@@ -1578,6 +1780,8 @@ async function purgeUser(c: Ctx, user: User): Promise<void> {
     kv.delete(`voice:${user.id}`),
     kv.delete(`usage:${user.id}:${month}`),
     kv.delete(`limits:${user.id}`),
+    kv.delete(`labels:${user.id}`),
+    kv.delete(`auditmeta:${user.id}`),
   ]);
   await deleteUser(kv, user); // user, email index, vault, pending, audit
 }
@@ -1598,6 +1802,17 @@ app.get("/account", async (c) => {
 <p class="muted">Your whole vault — facts, subjects, photos, voice takes, pending items and audit log — in one file. No support ticket, no waiting.</p>
 <p><a href="/account/export">Download my vault (JSON) →</a></p>
 
+<h2>Bring a vault in</h2>
+<div class="card">
+  <p class="muted">Load a Helix export — from another vault, a self-hosted one, or your own backup. It <strong>merges</strong>: nothing already here is overwritten, and importing the same file twice changes nothing.</p>
+  <p class="muted">Audit history and app connections stay behind by design; they belong to the server that issued them.</p>
+  <form method="POST" action="/account/import" enctype="multipart/form-data">
+    <label>Export file (.json)</label>
+    <input type="file" name="file" accept="application/json,.json" required>
+    <button>Import into my vault</button>
+  </form>
+</div>
+
 <h2>Delete everything</h2>
 <div class="card">
   <p>This removes your vault, subjects and their photos, voice recordings, audit log, and connected apps. It happens immediately and cannot be undone.</p>
@@ -1614,12 +1829,13 @@ app.get("/account", async (c) => {
 /** The whole vault as one portable document. Exit rights as code. */
 export async function buildExport(c: Ctx, user: User): Promise<Record<string, unknown>> {
   const kv = c.env.VAULT_KV;
-  const [vault, refs, voice, pending, audit] = await Promise.all([
+  const [vault, refs, voice, pending, audit, labelDoc] = await Promise.all([
     loadVault(kv, user.id, { name: user.name, email: user.email }),
     listSubjects(kv, user.id),
     loadVoice(kv, user.id),
     listPending(kv, user.id),
     readAudit(kv, user.id),
+    loadLabels(kv, user.id),
   ]);
   const subjects = [];
   for (const r of refs) {
@@ -1634,6 +1850,11 @@ export async function buildExport(c: Ctx, user: User): Promise<Record<string, un
     vault,
     subjects,
     voice: { verified_at: voice.verifiedAt ?? null, takes: voice.takes },
+    // Keyed by entry id, which is a pure function of category + list + text —
+    // so the same entry gets the same id in any vault, and these marks land
+    // on the right entries after an import. Without this section, importing
+    // would silently un-private everything you'd hidden.
+    marks: { labels: labelDoc.labels, private: labelDoc.private },
     pending,
     audit,
     connected_apps: grants.map((g) => ({
@@ -1653,6 +1874,56 @@ app.get("/account/export", async (c) => {
       "Content-Disposition": `attachment; filename="helix-vault-${user.id}-${new Date().toISOString().slice(0, 10)}.json"`,
     },
   });
+});
+
+/** Import's mirror. Owner-only: apps propose, owners load documents. */
+app.post("/account/import", async (c) => {
+  const user = await sessionUser(c);
+  if (!user) return c.redirect("/login");
+  const file = (await c.req.formData()).get("file");
+  const nav = await navFor(c, user);
+  const back = `<p><a href="/account">← Back to account</a></p>`;
+  const fail = (msg: string) =>
+    c.html(page("Import — Helix", `${nav}<h1>Import</h1><div class="card"><p>${esc(msg)}</p>${back}</div>`), 400);
+
+  if (!(file instanceof File)) return fail("No file was attached.");
+  if (file.size > MAX_IMPORT_BYTES)
+    return fail(
+      `That file is ${(file.size / 1024 / 1024).toFixed(1)} MB; the limit is ${MAX_IMPORT_BYTES / 1024 / 1024} MB. If it's photo-heavy, import the vault first and move subjects across separately.`,
+    );
+
+  let doc: unknown;
+  try {
+    doc = JSON.parse(await file.text());
+  } catch {
+    return fail("That file isn't valid JSON. A Helix export is the .json file from “Download my vault”.");
+  }
+  const problem = checkExport(doc);
+  if (problem) return fail(problem);
+
+  const r = await importExport(c.env.VAULT_KV, user.id, doc);
+  await appendAudit(c.env.VAULT_KV, user.id, {
+    client: "Helix (owner)",
+    action: "write",
+    detail: importSummary(r),
+  });
+
+  const notes = r.notes.length
+    ? `<h2>Worth knowing</h2>${r.notes.map((n) => `<p class="muted">${esc(n)}</p>`).join("")}`
+    : "";
+  return c.html(
+    page(
+      "Import — Helix",
+      `${nav}<h1>Import complete</h1>
+<div class="card">
+  <p><strong>${r.facts}</strong> fact${r.facts === 1 ? "" : "s"}, <strong>${r.subjects}</strong> subject${r.subjects === 1 ? "" : "s"}, <strong>${r.photos}</strong> photo${r.photos === 1 ? "" : "s"} and <strong>${r.takes}</strong> voice take${r.takes === 1 ? "" : "s"} were added.</p>
+  <p class="muted">Anything already in your vault was left alone, so importing this file again would add nothing.</p>
+  <p><a href="/vault">Review your vault →</a></p>
+</div>
+${notes}
+${back}`,
+    ),
+  );
 });
 
 app.post("/account/delete", async (c) => {
@@ -1887,6 +2158,17 @@ app.post("/owner/decide", async (c) => {
   if (!body?.id) return c.json({ error: "id required" }, 400);
   const action = body.action === "approve" ? "approve" : "reject";
   const decided = await decidePending(c.env.VAULT_KV, device.userId, body.id, action);
+  const verb = action === "approve" ? "approved" : "rejected";
+  if (decided) {
+    await appendAudit(c.env.VAULT_KV, device.userId, {
+      client: `You (${device.deviceName})`,
+      action: "write",
+      detail:
+        decided.kind === "labels"
+          ? `${verb} labels ${(decided.labels ?? []).join(", ")} proposed by ${decided.client}`
+          : `${verb} "${decided.fact.slice(0, 80)}" proposed by ${decided.client}`,
+    });
+  }
   const pending = await listPending(c.env.VAULT_KV, device.userId);
   return c.json({ ok: decided !== null, pending_count: pending.length });
 });
@@ -1939,6 +2221,11 @@ app.post("/owner/vault/add", async (c) => {
   const vault = await loadVault(c.env.VAULT_KV, device.userId);
   vault[category].base.push(text.slice(0, 500));
   await saveVault(c.env.VAULT_KV, device.userId, vault);
+  await appendAudit(c.env.VAULT_KV, device.userId, {
+    client: `You (${device.deviceName})`,
+    action: "write",
+    detail: `added to ${category}: "${text.slice(0, 80)}"`,
+  });
   return c.json({ ok: true });
 });
 
@@ -1954,6 +2241,12 @@ app.post("/owner/vault/update", async (c) => {
   if (hit.list === "base") vault[hit.category].base[hit.index] = text.slice(0, 500);
   else vault[hit.category].learned[hit.index].fact = text.slice(0, 500);
   await saveVault(c.env.VAULT_KV, device.userId, vault);
+  await relabelEntry(c.env.VAULT_KV, device.userId, body.id, entryIdOf(hit.category, hit.list, text.slice(0, 500)));
+  await appendAudit(c.env.VAULT_KV, device.userId, {
+    client: `You (${device.deviceName})`,
+    action: "write",
+    detail: `edited a ${hit.category} entry`,
+  });
   return c.json({ ok: true });
 });
 
@@ -1968,6 +2261,14 @@ app.post("/owner/vault/delete", async (c) => {
   if (hit.list === "base") vault[hit.category].base.splice(hit.index, 1);
   else vault[hit.category].learned.splice(hit.index, 1);
   await saveVault(c.env.VAULT_KV, device.userId, vault);
+  await pruneLabels(c.env.VAULT_KV, device.userId, vault);
+  // Deliberately no text: the audit log is append-only and hash-chained, so
+  // echoing a deleted entry into it would mean deletion didn't delete.
+  await appendAudit(c.env.VAULT_KV, device.userId, {
+    client: `You (${device.deviceName})`,
+    action: "write",
+    detail: `deleted a ${hit.category} entry`,
+  });
   return c.json({ ok: true });
 });
 
@@ -2169,11 +2470,34 @@ app.get("/owner/export", async (c) => {
   return c.json(await buildExport(c, user));
 });
 
+/** …and the way back in. Same merge rules as the web door. */
+app.post("/owner/import", async (c) => {
+  const device = await ownerFromBearer(c);
+  if (!device) return c.json({ error: "unauthorized" }, 401);
+  let doc: unknown;
+  try {
+    doc = await c.req.json();
+  } catch {
+    return c.json({ error: "body must be a Helix export document" }, 400);
+  }
+  const problem = checkExport(doc);
+  if (problem) return c.json({ error: problem }, 400);
+  const r = await importExport(c.env.VAULT_KV, device.userId, doc);
+  await appendAudit(c.env.VAULT_KV, device.userId, {
+    client: `Helix (${device.deviceName})`,
+    action: "write",
+    detail: importSummary(r),
+  });
+  return c.json(r);
+});
+
 app.get("/owner/audit", async (c) => {
   const device = await ownerFromBearer(c);
   if (!device) return c.json({ error: "unauthorized" }, 401);
   const audit = await readAudit(c.env.VAULT_KV, device.userId);
-  return c.json({ audit: audit.slice(0, 100) });
+  // The phone gets the same verdict as the web page — a trust claim that only
+  // holds on one screen isn't one.
+  return c.json({ audit: audit.slice(0, 100), chain: await verifyAuditChain(audit) });
 });
 
 app.get("/owner/connections", async (c) => {
@@ -2235,6 +2559,11 @@ app.post("/connections/devices/revoke", async (c) => {
 });
 
 
-export { entryId } from "./vault";
+export { entryId, normalizeVault } from "./vault";
+export { verifyAuditChain, auditHash, appendAudit } from "./vault";
+export * as labels from "./labels";
+export * as toolsig from "./toolsig";
+export * as activity from "./activity";
+export { compileError as compileErrorForTest } from "./voice";
 export { runBackup } from "./backup";
 export default app;

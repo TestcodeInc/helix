@@ -1,5 +1,32 @@
 // UX smoke for the non-MCP routes: runs src/app.ts under Node with a mock KV.
-import app from "/tmp/helix-app.mjs";
+//
+// The bundle at /tmp/helix-app.mjs is built by `npm test`. Run this file
+// directly and it will refuse to use a bundle older than src/ — a stale
+// bundle means the suite passes against code you no longer have, which is
+// worse than no suite at all.
+import { statSync, readdirSync, existsSync } from "node:fs";
+import { join } from "node:path";
+
+const BUNDLE = "/tmp/helix-app.mjs";
+const BUILD = "npx esbuild src/app.ts --bundle --format=esm --platform=neutral --outfile=/tmp/helix-app.mjs";
+{
+  if (!existsSync(BUNDLE)) {
+    console.error(`✗ no bundle at ${BUNDLE}. Build it:\n    ${BUILD}\n  (or just run: npm test)`);
+    process.exit(1);
+  }
+  const newest = (dir) =>
+    readdirSync(dir).reduce((max, name) => {
+      const p = join(dir, name);
+      const s = statSync(p);
+      return Math.max(max, s.isDirectory() ? newest(p) : s.mtimeMs);
+    }, 0);
+  if (statSync(BUNDLE).mtimeMs < newest("src")) {
+    console.error(`✗ ${BUNDLE} is older than src/ — rebuild before trusting this run:\n    ${BUILD}\n  (or just run: npm test)`);
+    process.exit(1);
+  }
+}
+
+const { default: app } = await import(BUNDLE);
 
 const store = new Map();
 const kv = {
@@ -172,6 +199,98 @@ check("owner door exports the whole vault", j.format === "helix-export/v1" && !!
 r = await req("/owner/export");
 check("export requires a device token", r.status === 401);
 
+// ---- import: the round trip -------------------------------------------
+// Dave's own export, loaded into an empty vault (Erin), must reproduce it.
+const daveExport = await (await req("/owner/export", { headers: { Authorization: `Bearer ${devTok}` } })).json();
+check("export carries facts and a subject to test with", daveExport.subjects.length > 0);
+
+const { entryId: eidNow2 } = await import("/tmp/helix-app.mjs");
+const sha256hex = async (s) =>
+  [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)))]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+await kv.put("user:erin", JSON.stringify({ id: "erin", name: "Erin", email: "erin@test.dev", passHash: "unused", createdAt: new Date().toISOString() }));
+const erinTok = "e".repeat(64);
+await kv.put(`device:${await sha256hex(erinTok)}`, JSON.stringify({ userId: "erin", deviceName: "Erin's phone", createdAt: new Date().toISOString() }));
+
+r = await jpost("/owner/import", daveExport, erinTok);
+j = await r.json();
+check("import reports what it loaded", j.facts > 0 && j.subjects === daveExport.subjects.length);
+const erinVault = JSON.parse(store.get("vault:erin"));
+const daveIdentity = daveExport.vault.identity.base;
+check("imported facts land in the right category", daveIdentity.every((t) => erinVault.identity.base.includes(t)));
+const erinSubjects = JSON.parse(store.get("subjectindex:erin"));
+check("imported subject keeps name and species", erinSubjects[0].name === daveExport.subjects[0].name && erinSubjects[0].species === daveExport.subjects[0].species);
+check("imported photos travel with the subject", erinSubjects[0].photoCount === daveExport.subjects[0].photos.length);
+
+// Idempotence: the same file again must change nothing.
+r = await jpost("/owner/import", daveExport, erinTok);
+j = await r.json();
+check("re-importing the same export is a no-op", j.facts === 0 && j.subjects === 0 && j.photos === 0);
+
+// Refusals: history and grants don't travel, and they're explained.
+const withHistory = { ...daveExport, audit: [{ at: new Date().toISOString(), client: "Elsewhere", action: "read", detail: "identity" }], connected_apps: [{ app: "Somewhere", scopes: ["identity"] }] };
+r = await jpost("/owner/import", withHistory, erinTok);
+j = await r.json();
+check("a foreign audit log is refused, with a reason", j.notes.some((n) => n.includes("audit")));
+check("foreign app grants are refused too", j.notes.some((n) => n.includes("connected app")));
+check("the foreign audit didn't land", !JSON.parse(store.get("audit:erin")).some((e) => e.client === "Elsewhere"));
+check("the import itself is audited", JSON.parse(store.get("audit:erin")).some((e) => e.action === "write" && e.detail.startsWith("imported")));
+
+// Envelope validation.
+r = await jpost("/owner/import", { format: "someone-elses/v3", vault: {} }, erinTok);
+check("an unknown format is rejected", r.status === 400 && (await r.json()).error.includes("helix-export/v1"));
+r = await jpost("/owner/import", { format: "helix-export/v1" }, erinTok);
+check("a truncated export is rejected", r.status === 400);
+r = await jpost("/owner/import", daveExport);
+check("import requires a device token", r.status === 401);
+
+// Marks must survive the round trip. Without this, moving vaults would
+// quietly un-private everything the owner had hidden.
+const daveVault = JSON.parse(store.get("vault:dave"));
+const privateFact = daveVault.identity.base[0];
+const privateId = eidNow2("identity", "base", privateFact);
+await kv.put("labels:dave", JSON.stringify({ labels: { [privateId]: ["helix"] }, private: [privateId] }));
+const marked = await (await req("/owner/export", { headers: { Authorization: `Bearer ${devTok}` } })).json();
+check("export carries labels and private flags", marked.marks.private.includes(privateId) && marked.marks.labels[privateId][0] === "helix");
+await kv.delete("labels:erin");
+r = await jpost("/owner/import", marked, erinTok);
+j = await r.json();
+const erinMarks = JSON.parse(store.get("labels:erin"));
+check("import re-applies the private flag", erinMarks.private.includes(privateId));
+check("import re-applies labels", erinMarks.labels[privateId]?.[0] === "helix");
+check("marks are counted in the result", j.marks > 0);
+// Content-hash ids are the mechanism: same text, same category, same id.
+check("a mark lands on the right entry in the new vault", JSON.parse(store.get("vault:erin")).identity.base.includes(privateFact));
+// A mark for an entry that isn't here is dropped rather than stored as junk.
+r = await jpost("/owner/import", { ...marked, marks: { labels: { zzzzzzz: ["ghost"] }, private: ["zzzzzzz"] } }, erinTok);
+check("marks for absent entries are ignored", !JSON.parse(store.get("labels:erin")).private.includes("zzzzzzz"));
+await kv.delete("labels:dave");
+
+// Voice verification is a live ceremony — it must not travel in a file.
+await kv.put("voice:dave", JSON.stringify({ takes: [{ id: "t1", style: "phrase", mime: "audio/mp4", b64: "YXVkaW8=", isPhrase: true, recordedAt: new Date().toISOString() }], phrase: { text: "x", issuedAt: new Date().toISOString() }, verifiedAt: new Date().toISOString() }));
+const voiced = await (await req("/owner/export", { headers: { Authorization: `Bearer ${devTok}` } })).json();
+r = await jpost("/owner/import", voiced, erinTok);
+j = await r.json();
+check("voice takes import", j.takes === 1);
+const erinVoice = JSON.parse(store.get("voice:erin"));
+check("but verification does not travel", !erinVoice.verifiedAt && erinVoice.takes.every((t) => t.isPhrase === false));
+check("and the reason is explained", j.notes.some((n) => n.includes("verified")));
+await kv.delete("voice:dave"); // put Dave back as the voice section expects to find him
+
+// The web door: same importer, reached with a file upload.
+const upload = async (name, body, cookie = dcookie) => {
+  const fd = new FormData();
+  fd.append("file", new File([body], name, { type: "application/json" }));
+  return req("/account/import", { method: "POST", headers: { Cookie: cookie }, body: fd });
+};
+r = await upload("notjson.json", "this is not json");
+check("web import explains bad JSON in plain language", r.status === 400 && (await r.text()).includes("isn't valid JSON"));
+r = await upload("vault.json", JSON.stringify(daveExport));
+check("web import merges and reports", r.status === 200 && (await r.text()).includes("Import complete"));
+const accountHtml = await (await req("/account", { headers: { Cookie: dcookie } })).text();
+check("account page offers import", accountHtml.includes("/account/import") && accountHtml.includes("merges"));
+
 // Seeded rather than assumed: without this the assertion silently depends on
 // the REST section above, which the open build doesn't have.
 await kv.put("audit:dave", JSON.stringify([
@@ -295,12 +414,14 @@ check("account page shows export + delete", (await r.text()).includes("Download 
 r = await req("/account/export", { headers: { Cookie: dcookie } });
 j = await r.json();
 check("export is a complete portable document", j.format === "helix-export/v1" && !!j.vault && Array.isArray(j.subjects) && Array.isArray(j.audit));
+await kv.put("labels:dave", JSON.stringify({ labels: { abc: ["helix"] }, private: ["abc"] }));
 r = await post("/account/delete", { passphrase: "wrong-passphrase" }, dcookie);
 check("delete requires the right passphrase", r.status === 401 && !!store.get("user:dave"));
 r = await post("/account/delete", { passphrase: "brand-new-passphrase" }, dcookie);
 check("delete needs the CURRENT passphrase (dave's is unchanged)", r.status === 401);
 r = await post("/account/delete", { passphrase: "dave-pass-123" }, dcookie);
 check("self-serve delete wipes the account", r.status === 200 && !store.get("user:dave") && !store.get("vault:dave") && !store.get("subjectindex:dave") && !store.get("voice:dave"));
+check("delete leaves no label residue either", !store.get("labels:dave"));
 
 // 17. scope hints on consent
 const authUrl = (scope) =>
@@ -318,6 +439,33 @@ check("consent names the app", aHtml.includes("Dog Photobooth is asking for"));
 aHtml = await (await req(authUrl(""))).text();
 check("no declared scopes falls back to context defaults", /value="identity"\s+checked/.test(aHtml) && !/value="likeness"\s+checked/.test(aHtml));
 check("plain-language labels, not slugs", aHtml.includes("Read people &amp; family") || aHtml.includes("Read people & family"));
+
+// 17b. label narrowing on the consent screen
+const invite2 = await post("/admin", { name: "Fay", email: "fay@test.dev", userId: "fay" }, acookie);
+const fayToken = (await invite2.text()).match(/id="invite">([^<]+)</)[1].split("/invite/")[1];
+const fcookie = cookieOf(await post(`/invite/${fayToken}`, { passphrase: "fay-pass-1234", passphrase2: "fay-pass-1234" }));
+const fayVault = JSON.parse(store.get("vault:fay"));
+const fayFirst = fayVault.identity.base[0];
+const { entryId: eidNow } = await import("/tmp/helix-app.mjs");
+await kv.put("labels:fay", JSON.stringify({ labels: { [eidNow("identity", "base", fayFirst)]: ["helix"] }, private: [] }));
+
+aHtml = await (await req(authUrl("identity"), { headers: { Cookie: fcookie } })).text();
+check("signed-in consent offers the labels in use", aHtml.includes('name="labels" value="helix"') && aHtml.includes("Limit this app to certain labels"));
+check("consent warns unlabelled entries go dark", aHtml.includes("becomes invisible"));
+const anonHtml = await (await req(authUrl("identity"))).text();
+check("signed-out consent offers no label narrowing", !anonHtml.includes('name="labels"'));
+
+let granted = null;
+env.OAUTH_PROVIDER.completeAuthorization = async (args) => { granted = args; return { redirectTo: "http://localhost:9999/cb?code=1" }; };
+await post("/authorize", { oauthreq: btoa(JSON.stringify({ clientId: "x" })), client_name: "Dog Photobooth", email: "fay@test.dev", passphrase: "fay-pass-1234", scopes: "identity", labels: "helix" }, fcookie);
+check("the grant carries the label restriction in props", granted?.props?.labels?.[0] === "helix");
+check("and in metadata, so /connections can show it", granted?.metadata?.labels?.[0] === "helix");
+await post("/authorize", { oauthreq: btoa(JSON.stringify({ clientId: "x" })), client_name: "Dog Photobooth", email: "fay@test.dev", passphrase: "fay-pass-1234", scopes: "identity" }, fcookie);
+check("no labels chosen means an unrestricted grant", Array.isArray(granted.props.labels) && granted.props.labels.length === 0);
+env.OAUTH_PROVIDER.listUserGrants = async () => ({ items: [{ id: "g1", clientId: "x", scope: ["identity"], metadata: { label: "Dog Photobooth → fay@test.dev", labels: ["helix"] } }] });
+const connHtml3 = await (await req("/connections", { headers: { Cookie: fcookie } })).text();
+check("connections shows what the app is limited to", connHtml3.includes("limited to") && connHtml3.includes(">helix<"));
+env.OAUTH_PROVIDER.listUserGrants = async () => ({ items: [] });
 
 // 18. backups
 const { runBackup } = await import("/tmp/helix-app.mjs");
@@ -337,6 +485,293 @@ check("backup skips ephemeral keys", !Object.keys(dumped.keys).some((k) => k.sta
 check("backup prunes old objects", env.BACKUPS.deleted === "backups/2020-01-01.json");
 bk = await runBackup({ ...env, BACKUPS: undefined });
 check("backup no-ops without R2 (self-host safe)", bk.ok === false && bk.error.includes("R2"));
+
+// ---- labels: the narrowing rules ---------------------------------------
+// These decide what an app can see, so they get tested as logic, not as HTML.
+const { labels: L, entryId: eid } = await import("/tmp/helix-app.mjs");
+const lv = {
+  identity: { base: ["Name: Dave", "Secret: has a tattoo"], learned: [] },
+  work: { base: ["Founder"], learned: [{ fact: "Ships Helix", source: "Claude", date: "2026-08-01" }] },
+  projects: { base: [], learned: [] },
+  preferences: { base: [], learned: [] },
+  relationships: { base: ["Tagged helix but personal"], learned: [] },
+  "communication-style": { base: [], learned: [] },
+};
+const secretId = eid("identity", "base", "Secret: has a tattoo");
+const shipsId = eid("work", "learned", "Ships Helix");
+const crossId = eid("relationships", "base", "Tagged helix but personal");
+const doc = { labels: { [shipsId]: ["helix"], [crossId]: ["helix"] }, private: [secretId] };
+
+check("label normalising is strict", L.normalizeLabel("  Helix v0.7 ") === "helix-v0-7" && L.normalizeLabel("!!!") === null);
+
+let seen = L.filterVault(lv, doc, {});
+check("an unrestricted grant sees everything but private", seen.identity.base.length === 1 && seen.work.learned.length === 1);
+check("private is withheld with no scope that can reveal it", !seen.identity.base.includes("Secret: has a tattoo"));
+
+seen = L.filterVault(lv, doc, { grantLabels: ["helix"] });
+check("a label-restricted grant sees only that label", seen.work.learned.length === 1 && seen.work.base.length === 0);
+check("unlabelled entries are invisible to a restricted grant", seen.identity.base.length === 0);
+
+// The escalation case: a `helix`-labelled entry lives in `relationships`
+// too. An app granted only `work` must never receive it — the categories
+// the caller passes are the ceiling, and labels only cut below it.
+check(
+  "a label cannot pull in a category the app wasn't granted",
+  seen.work.learned.some((l) => l.fact === "Ships Helix") &&
+    !["work", "identity", "projects", "preferences", "communication-style"].some((cat) =>
+      seen[cat].base.includes("Tagged helix but personal"),
+    ),
+);
+
+check("private stays hidden even when it carries the asked-for label", L.visibleTo({ labels: { [secretId]: ["helix"] }, private: [secretId] }, secretId, { askedLabels: ["helix"] }) === false);
+check("asking for an unused label returns nothing", L.filterVault(lv, doc, { askedLabels: ["nope"] }).work.learned.length === 0);
+check("the index counts only what the grant can see", JSON.stringify(L.labelIndex(lv, doc, ["work"])) === JSON.stringify([{ label: "helix", count: 1 }]));
+
+// Editing an entry must carry its marks to the new id, or a typo fix
+// silently un-privates it.
+await kv.put("labels:dave", JSON.stringify({ labels: { abc1234: ["helix"] }, private: ["abc1234"] }));
+await L.relabelEntry(kv, "dave", "abc1234", "def5678");
+const moved = JSON.parse(store.get("labels:dave"));
+check("edits carry labels to the new id", moved.labels.def5678?.[0] === "helix" && !moved.labels.abc1234);
+check("edits carry the private flag too", moved.private.includes("def5678") && !moved.private.includes("abc1234"));
+await kv.delete("labels:dave");
+
+// ---- labels through the review queue -----------------------------------
+// Tagging changes what apps can see, so it goes through approval like
+// everything else an app wants.
+const fVault = JSON.parse(store.get("vault:fay"));
+const fFact = fVault.identity.base[0];
+const fId = eidNow("identity", "base", fFact);
+await kv.put("labels:fay", JSON.stringify({ labels: {}, private: [] }));
+await kv.put("pending:fay", JSON.stringify([
+  { id: "lb1", kind: "labels", category: "identity", fact: "Tag as helix", source: "conversation", client: "Claude", proposedAt: new Date().toISOString(), labels: ["helix"], targetId: fId, targetText: fFact },
+]));
+const reviewHtml2 = await (await req("/review", { headers: { Cookie: fcookie } })).text();
+check("review reads a label proposal differently from a fact", reviewHtml2.includes("Tag an entry") && reviewHtml2.includes(">helix<"));
+check("review explains what a label does", reviewHtml2.includes("this slice and nothing else"));
+await post("/review/decide", { id: "lb1", action: "approve" }, fcookie);
+check("approving a label proposal tags the entry", JSON.parse(store.get("labels:fay")).labels[fId]?.[0] === "helix");
+check("and it leaves the text alone", JSON.parse(store.get("vault:fay")).identity.base[0] === fFact);
+
+await kv.put("pending:fay", JSON.stringify([
+  { id: "lb2", kind: "labels", category: "identity", fact: "Tag as private-stuff", source: "conversation", client: "Claude", proposedAt: new Date().toISOString(), labels: ["nope"], targetId: fId, targetText: fFact },
+]));
+await post("/review/decide", { id: "lb2", action: "reject" }, fcookie);
+check("rejecting a label proposal changes nothing", !JSON.parse(store.get("labels:fay")).labels[fId].includes("nope"));
+
+// A fact proposed with labels carries them through approval.
+await kv.put("pending:fay", JSON.stringify([
+  { id: "f9", category: "work", fact: "Ships Helix v0.7", source: "conversation", client: "Claude", proposedAt: new Date().toISOString(), labels: ["helix"] },
+]));
+await post("/review/decide", { id: "f9", action: "approve" }, fcookie);
+check("an approved fact keeps the labels it was proposed with", JSON.parse(store.get("labels:fay")).labels[eidNow("work", "learned", "Ships Helix v0.7")]?.[0] === "helix");
+
+// ---- the speech provider is disclosed, both places ---------------------
+// Found by reading a real audit entry: image generation named its provider,
+// speech didn't — and the consent screen claimed recordings are "never
+// shared" when they do reach the speech provider.
+const voiceConsent = await (await req(authUrl("likeness:voice"))).text();
+check("consent names the speech provider", voiceConsent.includes("ElevenLabs"));
+check("consent no longer claims recordings are never shared", !voiceConsent.includes("recordings are never shared"));
+check("consent still promises the app never gets them", voiceConsent.includes("app never receives your recordings"));
+
+// ---- provider failures are explained, not dumped -----------------------
+// Found by running generate_speech against production: a free ElevenLabs
+// plan can't clone voices, and the user saw raw provider JSON for a problem
+// only the operator can fix.
+const { compileErrorForTest } = await import("/tmp/helix-app.mjs");
+const billing = compileErrorForTest(400, '{"detail":{"type":"payment_required","code":"paid_plan_required"}}');
+check("a billing failure is named as the operator's problem", billing.includes("isn't something you can fix"));
+check("and reassures the owner their recordings are fine", billing.includes("Nothing is wrong with your recordings"));
+check("no raw provider JSON reaches the user", !billing.includes("paid_plan_required"));
+check("bad credentials read as configuration, not user error", compileErrorForTest(401, "unauthorized").includes("configuration problem"));
+check("rate limiting suggests waiting", compileErrorForTest(429, "slow down").includes("few minutes"));
+check("short recordings are the one the owner CAN fix", compileErrorForTest(400, "voice_too_short").includes("/voice"));
+
+// ---- vaults survive a new category being added -------------------------
+// Categories are OAuth scopes, so they get added over time. A vault written
+// before that has no key for the new one, and vault[newCat].base would throw
+// on the next read. This is what makes adding a category a one-line change.
+const { normalizeVault } = await import("/tmp/helix-app.mjs");
+const old = { identity: { base: ["Name: Fay"], learned: [] } };
+const filled = normalizeVault(old);
+check("a missing category is filled in, not crashed on", Array.isArray(filled.work.base) && filled.work.base.length === 0);
+check("existing content is untouched", filled.identity.base[0] === "Name: Fay");
+check("a malformed section is repaired", Array.isArray(normalizeVault({ work: { base: "not an array" } }).work.base));
+check("an empty vault normalises rather than throwing", Object.keys(normalizeVault(null)).length === 6);
+// A vault from a newer version keeps its unknown categories on a round trip.
+const future = normalizeVault({ identity: { base: [], learned: [] }, health: { base: ["Allergic to penicillin"], learned: [] } });
+check("categories from a newer version aren't destroyed", future.health.base[0] === "Allergic to penicillin");
+
+// An old-shaped vault must survive the real read paths, not just the helper.
+await kv.put("vault:fay", JSON.stringify({ identity: { base: ["Name: Fay"], learned: [] } }));
+const oldShape = await req("/vault", { headers: { Cookie: fcookie } });
+check("the vault page renders an old-shaped vault", oldShape.status === 200);
+const oldPreview = await (await req("/vault/preview", { headers: { Cookie: fcookie } })).text();
+check("and so does what an app would see", oldPreview.includes("# work"));
+
+// ---- double-clicking Approve ------------------------------------------
+// KV is eventually consistent, so two clicks a moment apart can both read a
+// pending list that still holds the item. Seen in production as one proposal
+// with two approvals in the audit log.
+await kv.put("vault:fay", JSON.stringify({
+  identity: { base: [], learned: [] }, work: { base: [], learned: [] },
+  projects: { base: [], learned: [] }, preferences: { base: [], learned: [] },
+  relationships: { base: [], learned: [] }, "communication-style": { base: [], learned: [] },
+}));
+const dupe = { id: "dup1", category: "relationships", fact: "Fostering two puppies, Mochi and Nuri.", source: "s", client: "Claude", proposedAt: new Date().toISOString() };
+await kv.put("pending:fay", JSON.stringify([dupe]));
+const reviewForm = await (await req("/review", { headers: { Cookie: fcookie } })).text();
+check("the form guards against a second submit", reviewForm.includes("dataset.sent"));
+await post("/review/decide", { id: "dup1", action: "approve" }, fcookie);
+// Simulate the stale read: the item is back in the list, as KV would serve it.
+await kv.put("pending:fay", JSON.stringify([dupe]));
+await post("/review/decide", { id: "dup1", action: "approve" }, fcookie);
+const dupeVault = JSON.parse(store.get("vault:fay"));
+check("approving twice adds the fact only once", dupeVault.relationships.learned.filter((l) => l.fact === dupe.fact).length === 1);
+
+// ---- the owner's own actions are audited too ---------------------------
+// Found by dogfooding: approvals were never logged, so the audit trail
+// recorded what apps asked for but not what was allowed.
+await kv.delete("audit:fay");
+await kv.delete("auditmeta:fay");
+await kv.put("pending:fay", JSON.stringify([
+  { id: "aud1", category: "work", fact: "Audited approval", source: "s", client: "Claude", proposedAt: new Date().toISOString() },
+  { id: "aud2", category: "work", fact: "Audited rejection", source: "s", client: "Claude", proposedAt: new Date().toISOString() },
+]));
+await post("/review/decide", { id: "aud1", action: "approve" }, fcookie);
+await post("/review/decide", { id: "aud2", action: "reject" }, fcookie);
+let fayAudit = JSON.parse(store.get("audit:fay"));
+check("approving is written to the audit log", fayAudit.some((e) => e.action === "write" && e.detail.startsWith("approved") && e.client === "You (web)"));
+check("rejecting is logged too", fayAudit.some((e) => e.detail.startsWith("rejected")));
+check("the log names which app proposed it", fayAudit.some((e) => e.detail.includes("proposed by Claude")));
+
+await post("/vault/add", { category: "work", text: "Typed by hand" }, fcookie);
+fayAudit = JSON.parse(store.get("audit:fay"));
+check("the owner's own additions are logged", fayAudit.some((e) => e.detail.includes('added to work: "Typed by hand"')));
+await post("/vault/update", { category: "work", list: "base", index: "0", action: "delete", text: "" }, fcookie);
+fayAudit = JSON.parse(store.get("audit:fay"));
+check("deletions are logged", fayAudit.some((e) => e.detail === "deleted a work entry"));
+check("but a deleted entry's text is never echoed into the log", !fayAudit.some((e) => e.detail.includes("Typed by hand") && e.detail.startsWith("deleted")));
+check("owner actions extend the same hash chain", (await (await import("/tmp/helix-app.mjs")).verifyAuditChain(fayAudit)).ok === true);
+
+// ---- owner-side supersession -------------------------------------------
+// A fact proposed and approved in one conversation never gets an id the AI
+// can see, so the AI can't ask to replace it later. The owner has to be able
+// to say so at review time instead.
+await kv.put("vault:fay", JSON.stringify({
+  identity: { base: ["Based in Atlanta, Georgia."], learned: [] },
+  work: { base: [], learned: [] }, projects: { base: [], learned: [] },
+  preferences: { base: [], learned: [] }, relationships: { base: [], learned: [] },
+  "communication-style": { base: [], learned: [] },
+}));
+const atlantaId = eidNow("identity", "base", "Based in Atlanta, Georgia.");
+await kv.put("pending:fay", JSON.stringify([
+  { id: "geo1", category: "identity", fact: "Lives in Rome, Georgia.", source: "conversation", client: "Claude", proposedAt: new Date().toISOString() },
+]));
+const revHtml = await (await req("/review", { headers: { Cookie: fcookie } })).text();
+check("review offers to replace an existing entry", revHtml.includes("Replace an existing entry with this?") && revHtml.includes(atlantaId));
+check("and explains what replacing does", revHtml.includes("removed on approval"));
+check("adding as new is the default option", revHtml.includes("Add it as a new entry"));
+
+await post("/review/decide", { id: "geo1", action: "approve", replaces: atlantaId }, fcookie);
+const fayGeo = JSON.parse(store.get("vault:fay"));
+check("approving with a replacement removes the old entry", !fayGeo.identity.base.includes("Based in Atlanta, Georgia."));
+check("and the correction lands", fayGeo.identity.learned.some((l) => l.fact === "Lives in Rome, Georgia."));
+
+// Choosing nothing still just adds, and a stale id can't do damage.
+await kv.put("pending:fay", JSON.stringify([
+  { id: "geo2", category: "identity", fact: "Grew up in Ohio.", source: "conversation", client: "Claude", proposedAt: new Date().toISOString() },
+]));
+await post("/review/decide", { id: "geo2", action: "approve", replaces: "zzzzzzz" }, fcookie);
+const fayGeo2 = JSON.parse(store.get("vault:fay"));
+check("an unknown replaces id degrades to a plain add", fayGeo2.identity.learned.some((l) => l.fact === "Grew up in Ohio.") && fayGeo2.identity.learned.some((l) => l.fact === "Lives in Rome, Georgia."));
+
+// ---- admin activity signal ---------------------------------------------
+// Counts and timestamps only. The states matter more than the numbers:
+// they're what tells James who to chase after an invite.
+const { activity: ACT } = await import("/tmp/helix-app.mjs");
+const ago = (d) => new Date(Date.now() - d * 86_400_000).toISOString();
+
+const blank = { pending: 0, oldestPendingDays: null, lastRead: null, lastCurated: null, labelled: 0, private: 0, devices: 0, images: { used: 0, limit: 20 }, speech: { used: 0, limit: 20 }, events: 0 };
+check("a user who never connected reads as cold", ACT.activitySummary({ ...blank }).state === "cold" && ACT.activitySummary({ ...blank }).text.includes("never connected"));
+check("events but no reads is still cold", ACT.activitySummary({ ...blank, events: 3 }).text.includes("no app has read"));
+check("a week-old queue is stuck", ACT.activitySummary({ ...blank, events: 9, pending: 4, oldestPendingDays: 9, lastRead: { at: ago(1), client: "Claude" } }).state === "stuck");
+check("and the rot is named, not just flagged", ACT.activitySummary({ ...blank, events: 9, pending: 4, oldestPendingDays: 9, lastRead: { at: ago(1), client: "Claude" } }).text.includes("rotting"));
+check("a fresh queue is not stuck", ACT.activitySummary({ ...blank, events: 9, pending: 2, oldestPendingDays: 1, lastRead: { at: ago(0), client: "Claude" }, lastCurated: ago(1) }).state === "warm");
+check("two weeks silent goes cold again", ACT.activitySummary({ ...blank, events: 9, lastRead: { at: ago(20), client: "ChatGPT" } }).state === "cold");
+check("reading without ever approving is called out", ACT.activitySummary({ ...blank, events: 5, lastRead: { at: ago(1), client: "Claude" } }).text.includes("never approved"));
+
+await kv.put("audit:fay", JSON.stringify([
+  { at: ago(2), client: "Claude", action: "read", detail: "identity", seq: 2, hash: "h2", prev: "h1" },
+  { at: ago(3), client: "Helix (owner)", action: "write", detail: "approved", seq: 1, hash: "h1", prev: "" },
+]));
+await kv.put("pending:fay", JSON.stringify([{ id: "p1", category: "work", fact: "x", source: "s", client: "Claude", proposedAt: ago(11) }]));
+const act = await ACT.userActivity(env, "fay");
+check("activity reads the real audit log", act.events === 2 && act.lastRead.client === "Claude");
+check("it finds the oldest pending item", act.oldestPendingDays === 11);
+check("it separates curation from reading", act.lastCurated?.startsWith(ago(3).slice(0, 10)));
+
+const adminHtml2 = await (await req("/admin", { headers: { Cookie: acookie } })).text();
+check("admin shows the activity line", adminHtml2.includes("queue is rotting"));
+check("admin says what it does not show", adminHtml2.includes("never vault contents"));
+check("admin never renders vault text", !adminHtml2.includes("Push test") && !adminHtml2.includes("Ships Helix"));
+await kv.delete("pending:fay");
+
+// ---- hash-chained audit -------------------------------------------------
+const { verifyAuditChain, appendAudit } = await import("/tmp/helix-app.mjs");
+await kv.delete("audit:chainy");
+await kv.delete("auditmeta:chainy");
+for (const d of ["identity", "work", "projects"]) {
+  await appendAudit(kv, "chainy", { client: "Claude", action: "read", detail: d });
+}
+let chainLog = JSON.parse(store.get("audit:chainy"));
+check("entries are numbered and hashed", chainLog.length === 3 && chainLog[0].seq === 3 && !!chainLog[0].hash);
+check("each entry points at the one before it", chainLog[0].prev === chainLog[1].hash && chainLog[2].prev === "");
+check("an untouched chain verifies", (await verifyAuditChain(chainLog)).ok === true);
+
+// Tamper: edit an entry's detail after the fact.
+let tampered = JSON.parse(JSON.stringify(chainLog));
+tampered[1].detail = "identity, relationships";
+let verdict = await verifyAuditChain(tampered);
+check("editing an entry breaks the chain", verdict.ok === false && verdict.reason === "entry was altered");
+check("and it names where", verdict.brokenAt === 2);
+
+// Tamper: remove an entry from the middle.
+tampered = chainLog.filter((e) => e.seq !== 2);
+verdict = await verifyAuditChain(tampered);
+check("removing an entry is detected", verdict.ok === false && verdict.reason === "an entry is missing");
+
+// Tamper: rewrite an entry AND its hash — the chain still catches it,
+// because the next entry's prev no longer matches.
+tampered = JSON.parse(JSON.stringify(chainLog));
+tampered[1].detail = "everything";
+tampered[1].hash = await (await import("/tmp/helix-app.mjs")).auditHash({ at: tampered[1].at, client: tampered[1].client, action: tampered[1].action, detail: "everything", seq: 2, prev: tampered[1].prev });
+verdict = await verifyAuditChain(tampered);
+check("re-hashing a forged entry doesn't help — the next link fails", verdict.ok === false);
+
+// Pre-chain entries are unproven, not broken.
+check("entries written before the chain are reported as unchecked", (await verifyAuditChain([{ at: "2026-01-01T00:00:00Z", client: "Old", action: "read", detail: "identity" }])).checked === 0);
+check("an empty log verifies trivially", (await verifyAuditChain([])).ok === true);
+
+// The owner's screens say so.
+await kv.put("audit:fay", JSON.stringify(chainLog));
+const auditHtml2 = await (await req("/audit", { headers: { Cookie: fcookie } })).text();
+check("audit page reports the chain intact", auditHtml2.includes("Chain intact"));
+check("and doesn't overclaim about deletion", auditHtml2.includes("deleted wholesale"));
+await kv.put("audit:fay", JSON.stringify(tampered));
+const auditHtml3 = await (await req("/audit", { headers: { Cookie: fcookie } })).text();
+check("a broken chain is stated plainly", auditHtml3.includes("Chain broken at entry"));
+
+// ---- tools/list_changed: announce only on a real change ----------------
+const { toolsig: TS } = await import("/tmp/helix-app.mjs");
+const sigA = TS.toolSignature(2, ["work", "identity", "propose"]);
+check("the signature ignores scope order", sigA === TS.toolSignature(2, ["propose", "identity", "work"]));
+check("a new toolset version is a new signature", sigA !== TS.toolSignature(3, ["work", "identity", "propose"]));
+check("different scopes are a different signature", sigA !== TS.toolSignature(2, ["work"]));
+check("a first-ever session announces nothing", TS.shouldAnnounce(undefined, sigA) === false);
+check("an unchanged session announces nothing", TS.shouldAnnounce(sigA, sigA) === false);
+check("a deploy that changes the toolset announces", TS.shouldAnnounce(TS.toolSignature(1, ["work"]), TS.toolSignature(2, ["work"])) === true);
 
 // 6. logged-out guard
 const guard = await req("/vault", { redirect: "manual" });

@@ -33,10 +33,57 @@ import { getUser } from "./users";
 import { notifyPending } from "./push";
 import { runBackup } from "./backup";
 import { withinLimit, recordUsage, limitMessage } from "./usage";
-import { MAX_PENDING } from "./ratelimit";
+import { MAX_PENDING, MAX_FACT_CHARS } from "./ratelimit";
+import {
+  loadLabels,
+  filterVault,
+  labelIndex,
+  normalizeLabel,
+  MAX_LABELS_PER_ENTRY,
+} from "./labels";
+import { toolSignature, shouldAnnounce } from "./toolsig";
+
+/**
+ * Bump when the tool set changes shape — a tool added, removed, renamed, or
+ * its schema changed in a way a client should re-read. Sessions that were
+ * connected under an older number are told to re-list, so a deploy reaches
+ * clients that would otherwise sit on a cached tool list until someone
+ * reconnected by hand.
+ */
+const TOOLSET_VERSION = 3; // 3: propose_learning gained `labels`; 2: propose_labels
 
 export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
-  server = new McpServer({ name: "Helix", version: "0.4.0" });
+  server = new McpServer(
+    { name: "Helix", version: "0.7.0" },
+    { capabilities: { tools: { listChanged: true } } },
+  );
+
+  /**
+   * Tell a client its cached tool list is stale — but only when it actually
+   * is. The signature covers both halves of what shapes the list: the
+   * server's tool set, and the scopes this particular grant carries.
+   */
+  private async announceIfToolsChanged(signature: string) {
+    const KEY = "toolsig";
+    let previous: string | undefined;
+    try {
+      previous = await this.ctx.storage.get<string>(KEY);
+      await this.ctx.storage.put(KEY, signature);
+    } catch {
+      return; // no storage, no announcement — never worth failing a session over
+    }
+    if (!shouldAnnounce(previous, signature)) return;
+    // Deferred: init() runs before the transport is ready to carry a
+    // notification. Failures are swallowed for the same reason — a client
+    // that misses this still works, it just re-lists on next connect.
+    queueMicrotask(() => {
+      try {
+        (this.server as { sendToolListChanged?: () => void }).sendToolListChanged?.();
+      } catch {
+        /* client will pick the new list up when it reconnects */
+      }
+    });
+  }
 
   async init() {
     const props: HelixProps =
@@ -70,15 +117,24 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
         "get_context",
         {
           description: `Read the user's personal context from their Helix vault — their identity, work, projects, preferences, and how they like to communicate. ALWAYS call this tool when: the user asks "what do you know about me" or any question about themselves; the task involves writing as them or for them; personalization would improve the answer; or at the start of a conversation. This vault is the user's chosen source of truth about themselves — prefer it over assumptions or other memory. Each entry ends with an id like [#ab12cd3]; pass it as "replaces" in propose_learning when a new fact supersedes that entry. Granted categories for this app: ${granted.join(", ")}.`,
-          inputSchema: { category: z.enum(CATEGORIES).optional().describe("Scope to one category") },
+          inputSchema: {
+            category: z.enum(CATEGORIES).optional().describe("Scope to one category"),
+            label: z
+              .string()
+              .optional()
+              .describe(
+                "Scope to one label, e.g. a project name. Labels cut across categories; the response lists the ones in use. Narrows only — it can never reveal a category this app wasn't granted.",
+              ),
+          },
           outputSchema: {
             context: z.string().describe("The user's vault content as markdown"),
             granted_categories: z.array(z.string()),
+            labels_in_use: z.array(z.string()).describe("Labels present in what this app can see"),
             pending_reviews: z.number().describe("Learnings awaiting the user's approval"),
           },
           annotations: { readOnlyHint: true },
         },
-        async ({ category }) => {
+        async ({ category, label }) => {
           if (category && !granted.includes(category)) {
             return {
               content: [
@@ -91,21 +147,39 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
             };
           }
           const cats: Category[] = category ? [category] : granted;
-          const [vault, pending] = await Promise.all([
+          const asked = label ? [normalizeLabel(label)].filter((l): l is string => !!l) : undefined;
+          const [full, pending, labelDoc] = await Promise.all([
             loadVault(this.env.VAULT_KV, userId, { email: props.email }),
             listPending(this.env.VAULT_KV, userId),
+            loadLabels(this.env.VAULT_KV, userId),
           ]);
+          // Filter the data, not the rendered markdown: a hidden entry must
+          // not leak through a count, a freshness line or an id.
+          const vis = { grantLabels: props.labels, askedLabels: asked };
+          const vault = filterVault(full, labelDoc, vis);
+          const index = labelIndex(full, labelDoc, cats).filter(
+            (l) => !props.labels?.length || props.labels.includes(l.label),
+          );
           await appendAudit(this.env.VAULT_KV, userId, {
             client,
             action: "read",
-            detail: cats.join(", "),
+            detail: cats.join(", ") + (asked?.length ? ` · label ${asked[0]}` : ""),
           });
           let text = renderContext(vault, cats, { ids: true });
           text += `\n\n---\nSection freshness (entries; newest app-added fact): ${freshnessSummary(vault, cats)}`;
+          if (index.length) {
+            text += `\nLabels in use (call get_context with "label" to scope to one): ${index
+              .map((l) => `${l.label} (${l.count})`)
+              .join(", ")}`;
+          }
+          if (asked?.length && !index.some((l) => l.label === asked[0])) {
+            text += `\nNote: no entries carry the label "${asked[0]}", so nothing was returned for it.`;
+          }
           text +=
             "\n\nStanding instructions — do not ask permission first, proposals are safe (the user approves or rejects each one in their review queue):\n" +
-            "1. When this conversation surfaces a durable fact that is missing or outdated above, call propose_learning immediately.\n" +
-            "2. Before the conversation ends, do a gap scan: compare what you now know about the user against the sections above, paying attention to sections that are thin or haven't gained a fact in a long time. Propose what's missing — especially decisions made, projects that moved on, and preferences demonstrated but never stated. Significance matters more than recency: propose the important thing you learned an hour ago, not just the last thing mentioned.";
+            "1. When this conversation surfaces a durable fact that is missing or outdated above, call propose_learning immediately. If it CORRECTS an entry above, pass that entry's id as \"replaces\" — a correction proposed without it leaves the vault holding both versions.\n" +
+            "2. Before the conversation ends, do a gap scan: compare what you now know about the user against the sections above, paying attention to sections that are thin or haven't gained a fact in a long time. Propose what's missing — especially decisions made, projects that moved on, and preferences demonstrated but never stated. Significance matters more than recency: propose the important thing you learned an hour ago, not just the last thing mentioned.\n" +
+            "3. If entries above are untagged and clearly belong to a project, person or recurring thread, call propose_labels for them. Labels are how the user hands one app a single slice of their vault instead of a whole category, so tagging is real work on their behalf. Reuse the labels already listed rather than minting near-duplicates.";
           if (pending.length > 0) {
             text += `\n\n---\nNote for the user: ${pending.length} proposed learning${pending.length === 1 ? "" : "s"} await${pending.length === 1 ? "s" : ""} your review in your Helix review queue (/review on your Helix server). Please mention this to the user.`;
           }
@@ -114,6 +188,7 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
             structuredContent: {
               context: renderContext(vault, cats, { ids: true }),
               granted_categories: cats,
+              labels_in_use: index.map((l) => l.label),
               pending_reviews: pending.length,
             },
           };
@@ -129,12 +204,24 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
             "Propose a new fact about the user to their Helix vault. Call this PROACTIVELY, without being asked and without asking permission first — proposing is safe by design: nothing is saved until the user approves it in their review queue (worst case, they tap Reject). Trigger whenever the conversation surfaces something durable: a new project, thesis, preference, decision, relationship, role change, tradition, or life event. If the user articulates or refines an important idea over the course of a conversation, propose the refined version. Keep facts short, specific, and in third person. If the new fact updates or contradicts an existing vault entry, pass that entry's id (shown as [#id] in get_context output) as `replaces` — on approval the old entry is removed and this one takes its place.",
           inputSchema: {
             category: z.enum(CATEGORIES).describe("Which vault category this belongs to"),
-            fact: z.string().min(3).max(500).describe('Short third-person fact, e.g. "Started a new project called Atlas"'),
+            // Length is checked in the handler, not here: a schema violation
+            // surfaces to the model as a raw validation error with no hint
+            // about what to do, and the right move is almost always "trim".
+            fact: z
+              .string()
+              .min(3)
+              .describe('Short third-person fact, 500 characters max, e.g. "Started a new project called Atlas"'),
             source: z.string().default("conversation"),
             replaces: z
               .string()
               .optional()
               .describe('Id of the vault entry this fact supersedes, from get_context (e.g. "ab12cd3" for [#ab12cd3])'),
+            labels: z
+              .array(z.string())
+              .optional()
+              .describe(
+                "Labels to attach if approved — reuse the ones already in use (get_context lists them) rather than inventing near-duplicates. Labels let the user hand another app this slice and nothing else.",
+              ),
           },
           outputSchema: {
             id: z.string().describe("Id of the pending learning"),
@@ -145,7 +232,21 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
               .describe("Whether the replaces id matched a current vault entry"),
           },
         },
-        async ({ category, fact, source, replaces }) => {
+        async ({ category, fact, source, replaces, labels }) => {
+          const cleanLabels = [
+            ...new Set((labels ?? []).map(normalizeLabel).filter((l): l is string => !!l)),
+          ].slice(0, MAX_LABELS_PER_ENTRY);
+          if (fact.length > MAX_FACT_CHARS) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `That fact is ${fact.length} characters; the limit is ${MAX_FACT_CHARS}. Vault entries are meant to be read at a glance — keep the durable core, drop the detail, and call again. If it genuinely covers two separate things, propose it as two facts.`,
+                },
+              ],
+              isError: true,
+            };
+          }
           // Keep a chatty (or hostile) app from burying the review queue.
           const queued = await listPending(this.env.VAULT_KV, userId);
           if (queued.length >= MAX_PENDING) {
@@ -161,7 +262,14 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
           }
           let replacesText: string | undefined;
           if (replaces) {
-            const vault = await loadVault(this.env.VAULT_KV, userId, { email: props.email });
+            const [full, labelDoc] = await Promise.all([
+              loadVault(this.env.VAULT_KV, userId, { email: props.email }),
+              loadLabels(this.env.VAULT_KV, userId),
+            ]);
+            // Resolve against what this app can see. An app must not be able
+            // to supersede — or confirm the existence of — a private entry by
+            // guessing at ids.
+            const vault = filterVault(full, labelDoc, { grantLabels: props.labels });
             const old = findEntry(vault, replaces.replace(/^\[?#/, "").replace(/\]$/, ""));
             if (!old) {
               return {
@@ -182,6 +290,7 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
             source,
             client,
             ...(replaces ? { replaces: replaces.replace(/^\[?#/, "").replace(/\]$/, ""), replacesText } : {}),
+            ...(cleanLabels.length ? { labels: cleanLabels } : {}),
           });
           await appendAudit(this.env.VAULT_KV, userId, {
             client,
@@ -191,11 +300,19 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
           // Buzz the owner's devices: Approve/Reject from the lock screen.
           const pendingNow = await listPending(this.env.VAULT_KV, userId);
           await notifyPending(this.env, userId, entry, pendingNow.length);
+          // Correcting a fact you proposed earlier in the same conversation
+          // is the common case, and the hardest one: the entry didn't exist
+          // when get_context was read, so there is no id in this transcript
+          // to supersede. Say so, rather than letting a contradiction sit in
+          // the vault because nobody knew to remove the old line.
+          const supersedeHint = replaces
+            ? ""
+            : "\n\nIf this CORRECTS something already in the vault — including a fact you proposed earlier in this conversation — call get_context again to get the current id, then propose again with \"replaces\" set to it. Approving an unlinked correction leaves both the old and new versions in place, which is worse than either alone.";
           return {
             content: [
               {
                 type: "text",
-                text: `Proposed to Helix (id ${entry.id})${replacesText ? ` as a replacement for "${replacesText}"` : ""}. It is awaiting the user's review at /review.`,
+                text: `Proposed to Helix (id ${entry.id})${replacesText ? ` as a replacement for "${replacesText}"` : ""}. It is awaiting the user's review at /review.${supersedeHint}`,
               },
             ],
             structuredContent: {
@@ -203,6 +320,89 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
               status: "pending_review" as const,
               ...(replaces ? { replaces_resolved: true } : {}),
             },
+          };
+        },
+      );
+    }
+
+    if (canPropose) {
+      this.server.registerTool(
+        "propose_labels",
+        {
+          description:
+            "Propose labels for an entry that is already in the user's vault. Labels cut across categories and let the user hand a single app one slice of their context — so tagging is genuinely useful work, not busywork. Call this PROACTIVELY when get_context shows untagged entries that clearly belong to a project, a person, or a recurring thread; the user approves or rejects in their review queue, so proposing is safe. Reuse labels already in use (get_context lists them with counts) rather than inventing near-duplicates like \"helix-app\" next to \"helix\".",
+          inputSchema: {
+            entry_id: z
+              .string()
+              .describe('Id of the entry to tag, from get_context (e.g. "ab12cd3" for [#ab12cd3])'),
+            labels: z.array(z.string()).min(1).describe("One or more labels, lowercase and short"),
+          },
+          outputSchema: {
+            id: z.string(),
+            status: z.literal("pending_review"),
+            labels: z.array(z.string()),
+          },
+        },
+        async ({ entry_id, labels }) => {
+          const clean = [
+            ...new Set(labels.map(normalizeLabel).filter((l): l is string => !!l)),
+          ].slice(0, MAX_LABELS_PER_ENTRY);
+          if (!clean.length) {
+            return {
+              content: [{ type: "text", text: "No usable labels — use short lowercase words, letters and digits." }],
+              isError: true,
+            };
+          }
+          const [full, labelDoc] = await Promise.all([
+            loadVault(this.env.VAULT_KV, userId, { email: props.email }),
+            loadLabels(this.env.VAULT_KV, userId),
+          ]);
+          // Resolved against the filtered view for the same reason as
+          // propose_learning: an app must not learn that a hidden entry exists.
+          const visible = filterVault(full, labelDoc, { grantLabels: props.labels });
+          const id = entry_id.replace(/^\[?#/, "").replace(/\]$/, "");
+          const target = findEntry(visible, id);
+          if (!target) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Unknown entry id "${entry_id}". Ids come from get_context and change when an entry is edited — re-read the vault first.`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const queued = await listPending(this.env.VAULT_KV, userId);
+          if (queued.length >= MAX_PENDING) {
+            return {
+              content: [{ type: "text", text: `The user's review queue is full (${MAX_PENDING} items). Ask them to clear it at /review.` }],
+              isError: true,
+            };
+          }
+          const entry = await addPending(this.env.VAULT_KV, userId, {
+            kind: "labels",
+            category: target.category,
+            fact: `Tag as ${clean.join(", ")}`,
+            source: "conversation",
+            client,
+            labels: clean,
+            targetId: id,
+            targetText: target.text,
+          });
+          await appendAudit(this.env.VAULT_KV, userId, {
+            client,
+            action: "propose",
+            detail: `labels ${clean.join(", ")} for "${target.text.slice(0, 60)}"`,
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Proposed labels ${clean.join(", ")} for "${target.text}" (id ${entry.id}). Awaiting the user's review at /review.`,
+              },
+            ],
+            structuredContent: { id: entry.id, status: "pending_review" as const, labels: clean },
           };
         },
       );
@@ -433,7 +633,7 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
           await appendAudit(this.env.VAULT_KV, userId, {
             client,
             action: "generate",
-            detail: `speech in the owner's voice (recordings stayed in vault) — "${text.slice(0, 120)}${text.length > 120 ? "…" : ""}"`,
+            detail: `speech in the owner's voice via ${result.provider} (recordings sent to provider, none to app) — "${text.slice(0, 120)}${text.length > 120 ? "…" : ""}"`,
           });
           await recordUsage(this.env.VAULT_KV, userId, "speech");
           const token = await stashGeneratedImage(this.env.VAULT_KV, result.b64, result.mime);
@@ -451,6 +651,8 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
         },
       );
     }
+
+    await this.announceIfToolsChanged(toolSignature(TOOLSET_VERSION, props.scopes));
   }
 }
 

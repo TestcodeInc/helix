@@ -142,8 +142,9 @@ async function ensureProviderVoice(
     body: form,
   });
   if (!res.ok) {
-    const detail = (await res.text()).slice(0, 200);
-    return { ok: false, error: `voice compile failed (${res.status}): ${detail}` };
+    const detail = (await res.text()).slice(0, 300);
+    console.error(`[voice] compile failed ${res.status}: ${detail}`);
+    return { ok: false, error: compileError(res.status, detail) };
   }
   const out = (await res.json()) as { voice_id?: string };
   if (!out.voice_id) return { ok: false, error: "provider returned no voice id" };
@@ -152,6 +153,33 @@ async function ensureProviderVoice(
   return { ok: true, voiceId: out.voice_id };
 }
 
+/**
+ * Turn a provider failure into something the reader can act on.
+ *
+ * The distinction that matters is whose problem it is. A billing or quota
+ * failure at the provider is the vault operator's to fix, and telling the
+ * owner to "try again" would send them in circles — so say plainly that it
+ * isn't them. Raw provider JSON helps nobody and leaks the operator's
+ * account details into a third-party app's conversation.
+ */
+export function compileError(status: number, detail: string): string {
+  const d = detail.toLowerCase();
+  if (d.includes("paid_plan_required") || d.includes("payment_required") || status === 402)
+    return "Voice generation is unavailable on this Helix server right now: the voice provider account doesn't have voice cloning enabled. Nothing is wrong with your recordings, and this isn't something you can fix — tell the person who runs this vault.";
+  if (status === 401 || status === 403)
+    return "Voice generation is unavailable on this Helix server: the voice provider rejected its credentials. Your recordings are fine — this is a server configuration problem.";
+  if (status === 429)
+    return "The voice provider is rate-limiting this Helix server. Try again in a few minutes.";
+  if (d.includes("too_short") || d.includes("duration"))
+    return "The provider couldn't build a voice from these recordings — they may be too short. Record another session at /voice with a little more in each card.";
+  return `Voice generation failed at the provider (status ${status}). Your recordings are unchanged. If this keeps happening, tell the person who runs this vault.`;
+}
+
+/** The downstream the owner's recordings actually reach. Named on the
+ * consent screen and in every audit entry — an undisclosed provider is the
+ * thing the whole likeness model exists to prevent. */
+export const VOICE_PROVIDER = "ElevenLabs (eleven_multilingual_v2)";
+
 /** Synthesize speech in the owner's voice. Returns mp3 bytes as base64. */
 export async function synthesize(
   kv: KVNamespace,
@@ -159,7 +187,9 @@ export async function synthesize(
   userName: string,
   apiKey: string | undefined,
   text: string,
-): Promise<{ ok: true; b64: string; mime: string } | { ok: false; status: number; error: string }> {
+): Promise<
+  { ok: true; b64: string; mime: string; provider: string } | { ok: false; status: number; error: string }
+> {
   if (!apiKey)
     return { ok: false, status: 501, error: "voice synthesis not configured (ELEVENLABS_API_KEY missing)" };
   const compiled = await ensureProviderVoice(kv, userId, apiKey, userName);
@@ -182,8 +212,9 @@ export async function synthesize(
     },
   );
   if (!res.ok) {
-    const detail = (await res.text()).slice(0, 200);
-    return { ok: false, status: 502, error: `provider error ${res.status}: ${detail}` };
+    const detail = (await res.text()).slice(0, 300);
+    console.error(`[voice] synthesis failed ${res.status}: ${detail}`);
+    return { ok: false, status: 502, error: compileError(res.status, detail) };
   }
   const buf = new Uint8Array(await res.arrayBuffer());
   let s = "";
@@ -191,5 +222,5 @@ export async function synthesize(
   for (let i = 0; i < buf.length; i += chunk) {
     s += String.fromCharCode(...buf.subarray(i, i + chunk));
   }
-  return { ok: true, b64: btoa(s), mime: "audio/mpeg" };
+  return { ok: true, b64: btoa(s), mime: "audio/mpeg", provider: VOICE_PROVIDER };
 }

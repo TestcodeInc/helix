@@ -34,6 +34,19 @@ export interface PendingLearning {
   replaces?: string;
   /** Snapshot of the superseded entry's text at propose time, for the review UI. */
   replacesText?: string;
+  /**
+   * "fact" (the default, and what every existing queued item is) proposes new
+   * text. "labels" proposes tagging an entry that already exists — same queue,
+   * same approve/reject, because labels decide what apps can see and that is
+   * the owner's call, not an app's.
+   */
+  kind?: "fact" | "labels";
+  /** Labels to attach: suggested alongside a new fact, or the whole point of a "labels" item. */
+  labels?: string[];
+  /** For kind "labels": the entry being tagged. */
+  targetId?: string;
+  /** Snapshot of that entry's text, so the review screen can show it. */
+  targetText?: string;
 }
 
 export interface AuditEntry {
@@ -41,6 +54,12 @@ export interface AuditEntry {
   client: string;
   action: "read" | "propose" | "generate" | "write";
   detail: string;
+  /** Monotonic per user. Gaps make a removed entry visible. */
+  seq?: number;
+  /** SHA-256 over this entry's content plus `prev`; the link in the chain. */
+  hash?: string;
+  /** Hash of the entry before this one. "" for the first ever. */
+  prev?: string;
 }
 
 const vaultKey = (userId: string) => `vault:${userId}`;
@@ -67,13 +86,40 @@ export function seedVault(name = "", email = ""): Vault {
   };
 }
 
+/**
+ * Fill in any category a stored vault doesn't have yet, and repair a
+ * malformed section.
+ *
+ * Categories are added to CATEGORIES over time, but a vault written before
+ * that has no key for the new one — and `vault[newCategory].base` on an
+ * undefined section throws on the very next read. Normalising here means
+ * adding a category is a one-line change to CATEGORIES rather than a
+ * migration across every stored vault.
+ *
+ * Deliberately non-destructive: unknown categories in stored JSON are left
+ * alone, so a vault written by a NEWER version (or exported from someone
+ * else's fork) survives a round trip through this one intact.
+ */
+export function normalizeVault(raw: unknown): Vault {
+  const stored = (raw ?? {}) as Record<string, unknown>;
+  const out = { ...stored } as Vault;
+  for (const cat of CATEGORIES) {
+    const section = stored[cat] as { base?: unknown; learned?: unknown } | undefined;
+    out[cat] = {
+      base: Array.isArray(section?.base) ? (section!.base as string[]) : [],
+      learned: Array.isArray(section?.learned) ? (section!.learned as LearnedFact[]) : [],
+    };
+  }
+  return out;
+}
+
 export async function loadVault(
   kv: KVNamespace,
   userId: string,
   seed?: { name?: string; email?: string },
 ): Promise<Vault> {
   const raw = await kv.get(vaultKey(userId));
-  if (raw) return JSON.parse(raw) as Vault;
+  if (raw) return normalizeVault(JSON.parse(raw));
   const vault = seedVault(seed?.name, seed?.email);
   await kv.put(vaultKey(userId), JSON.stringify(vault));
   return vault;
@@ -195,6 +241,19 @@ export async function decidePending(
   const idx = pending.findIndex((p) => p.id === id);
   if (idx === -1) return null;
   const [item] = pending.splice(idx, 1);
+
+  // A labels proposal touches no text — it only decides who can see an entry
+  // that already exists.
+  if (item.kind === "labels") {
+    if (action === "approve" && item.targetId) {
+      const { setLabels, loadLabels } = await import("./labels");
+      const existing = (await loadLabels(kv, userId)).labels[item.targetId] ?? [];
+      await setLabels(kv, userId, item.targetId, [...existing, ...(item.labels ?? [])]);
+    }
+    await kv.put(pendingKey(userId), JSON.stringify(pending));
+    return item;
+  }
+
   if (action === "approve") {
     const vault = await loadVault(kv, userId);
     // Supersession: remove the entry this fact replaces, if it still exists
@@ -206,28 +265,138 @@ export async function decidePending(
         else vault[old.category].learned.splice(old.index, 1);
       }
     }
-    vault[item.category].learned.push({
-      fact: item.fact,
-      source: item.client,
-      date: item.proposedAt.slice(0, 10),
-    });
-    await saveVault(kv, userId, vault);
+    // Idempotent: a double-submitted approval must not add the fact twice.
+    // KV is eventually consistent, so two clicks a moment apart can both read
+    // a pending list that still contains this item — the guard belongs here,
+    // where the write happens, not only in the browser.
+    const already = vault[item.category].learned.some((l) => l.fact === item.fact);
+    if (!already) {
+      vault[item.category].learned.push({
+        fact: item.fact,
+        source: item.client,
+        date: item.proposedAt.slice(0, 10),
+      });
+      await saveVault(kv, userId, vault);
+    }
+    const newId = entryId(item.category, "learned", item.fact);
+    // A superseding fact inherits the old entry's labels and private flag.
+    // Without this, an approved update would quietly un-hide something the
+    // owner had marked private.
+    if (item.replaces) {
+      const { relabelEntry } = await import("./labels");
+      await relabelEntry(kv, userId, item.replaces, newId);
+    }
+    if (item.labels?.length) {
+      const { setLabels, loadLabels } = await import("./labels");
+      const inherited = (await loadLabels(kv, userId)).labels[newId] ?? [];
+      await setLabels(kv, userId, newId, [...inherited, ...item.labels]);
+    }
   }
   await kv.put(pendingKey(userId), JSON.stringify(pending));
   return item;
 }
 
 const AUDIT_CAP = 200;
+const auditMetaKey = (userId: string) => `auditmeta:${userId}`;
 
+/**
+ * The link in the chain. Deliberately a plain string join of the fields that
+ * matter, in a fixed order: a reader implementing this independently — which
+ * is the point of publishing a spec — shouldn't have to match a JSON
+ * serialiser's quirks to reproduce a hash.
+ */
+export async function auditHash(e: {
+  at: string;
+  client: string;
+  action: string;
+  detail: string;
+  seq: number;
+  prev: string;
+}): Promise<string> {
+  const canonical = [e.seq, e.at, e.client, e.action, e.detail, e.prev].join("");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * Append to the tamper-evident log.
+ *
+ * Each entry carries the hash of the one before it, so altering or reordering
+ * any retained entry breaks every link after it. The sequence number is kept
+ * in its own key rather than derived from the array, because the array is
+ * capped — without it, an entry removed from a full log would be invisible.
+ *
+ * What this does and doesn't prove is stated plainly on the audit page: the
+ * chain shows that what's here hasn't been edited, not that nothing was ever
+ * deleted wholesale by whoever runs the server. Honest beats impressive.
+ */
 export async function appendAudit(
   kv: KVNamespace,
   userId: string,
-  entry: Omit<AuditEntry, "at">,
+  entry: Omit<AuditEntry, "at" | "seq" | "hash" | "prev">,
 ): Promise<void> {
-  const raw = await kv.get(auditKey(userId));
+  const [raw, metaRaw] = await Promise.all([kv.get(auditKey(userId)), kv.get(auditMetaKey(userId))]);
   const log: AuditEntry[] = raw ? JSON.parse(raw) : [];
-  log.unshift({ ...entry, at: new Date().toISOString() });
-  await kv.put(auditKey(userId), JSON.stringify(log.slice(0, AUDIT_CAP)));
+  const meta = metaRaw ? (JSON.parse(metaRaw) as { seq: number; hash: string }) : { seq: 0, hash: "" };
+
+  const next = {
+    ...entry,
+    at: new Date().toISOString(),
+    seq: meta.seq + 1,
+    prev: meta.hash,
+  };
+  const hash = await auditHash(next);
+  log.unshift({ ...next, hash });
+
+  await Promise.all([
+    kv.put(auditKey(userId), JSON.stringify(log.slice(0, AUDIT_CAP))),
+    kv.put(auditMetaKey(userId), JSON.stringify({ seq: next.seq, hash })),
+  ]);
+}
+
+export interface ChainCheck {
+  ok: boolean;
+  /** Entries covered by the chain (older ones predate it). */
+  checked: number;
+  /** Sequence number of the first entry that doesn't verify. */
+  brokenAt?: number;
+  reason?: string;
+}
+
+/**
+ * Verify a log, newest-first as stored. Entries written before this feature
+ * carry no hash; they're reported as unchecked rather than treated as broken,
+ * because an unproven entry and a forged one are different claims.
+ */
+export async function verifyAuditChain(log: AuditEntry[]): Promise<ChainCheck> {
+  const chained = log.filter((e) => e.hash && typeof e.seq === "number");
+  if (chained.length === 0) return { ok: true, checked: 0 };
+
+  const ordered = [...chained].sort((a, b) => a.seq! - b.seq!);
+  for (let i = 0; i < ordered.length; i++) {
+    const e = ordered[i];
+    const expected = await auditHash({
+      at: e.at,
+      client: e.client,
+      action: e.action,
+      detail: e.detail,
+      seq: e.seq!,
+      prev: e.prev ?? "",
+    });
+    if (expected !== e.hash)
+      return { ok: false, checked: ordered.length, brokenAt: e.seq, reason: "entry was altered" };
+    if (i > 0) {
+      const before = ordered[i - 1];
+      if (e.prev !== before.hash)
+        return {
+          ok: false,
+          checked: ordered.length,
+          brokenAt: e.seq,
+          reason: e.seq! - before.seq! > 1 ? "an entry is missing" : "entries were reordered",
+        };
+    }
+  }
+  return { ok: true, checked: ordered.length };
 }
 
 export async function readAudit(kv: KVNamespace, userId: string): Promise<AuditEntry[]> {

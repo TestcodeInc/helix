@@ -58,7 +58,9 @@ or the next publish will stop and tell you.
 | `usage.ts` | Monthly generation caps; per-user overrides in KV |
 | `ratelimit.ts` | IP buckets and Turnstile |
 | `email.ts` | Transactional mail (Resend); optional |
-| `backup.ts` | Nightly KV → R2 dump, 30-day retention |
+| `importer.ts` | Loads a `helix-export/v1` document back in: merge-only, idempotent, refuses to import history |
+| `labels.ts` | Labels and the private flag — the one place that decides what an app may see |
+| `backup.ts` | Nightly KV → R2 dump, 30-day retention (restore via `scripts/restore.mjs`) |
 | `push.ts` | APNs (ES256 via WebCrypto) |
 
 ## Develop
@@ -67,12 +69,14 @@ or the next publish will stop and tell you.
 npm install
 npm start          # wrangler dev
 npm run typecheck  # tsc --noEmit
-node uxtest.mjs    # assertions against a mocked KV, no network
+npm test           # bundle src/app.ts, then run it against a mocked KV
 ```
 
-`uxtest.mjs` bundles `src/app.ts` with esbuild and drives it under Node
-with an in-memory KV. It's the fastest way to know you haven't broken a
-flow; add an assertion with every behaviour change.
+`npm test` bundles `src/app.ts` with esbuild and drives it under Node with
+an in-memory KV — no network, no Cloudflare. It's the fastest way to know
+you haven't broken a flow; add an assertion with every behaviour change.
+Running `node uxtest.mjs` on its own is fine, but it refuses to start
+against a bundle older than `src/` rather than pass you a stale result.
 
 ## Deploy
 
@@ -95,14 +99,21 @@ Optional secrets — omit any and that feature stays off:
 
 An implementation that breaks one of these isn't Helix:
 
-- Apps never write facts directly — proposals go to the owner's queue.
+- Apps never write facts directly — proposals go to the owner's queue. So do
+  labels, because labels decide what other apps can see.
+- Labels only ever narrow. A label-restricted grant sees the intersection of
+  its categories and its labels, never a category it wasn't granted.
+- Private entries leave through no app door, whatever was granted.
 - Source media never crosses the app door.
 - Every read, proposal, write and generation is logged where the owner
-  can see it.
+  can see it, in a hash-chained log that shows if an entry was altered.
 - Revocation takes effect immediately, including mid-session.
 - Generation names its downstream provider on the consent screen and in
   the audit entry.
-- The owner can export everything and delete everything, alone.
+- The owner can export everything, import it elsewhere, and delete
+  everything — alone.
+- History doesn't travel. An imported audit log is refused: the log records
+  what this server did, and a document must not be able to dictate that.
 
 ## Licence
 

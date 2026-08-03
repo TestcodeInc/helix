@@ -68,3 +68,7 @@ export function turnstileWidget(env: Env): string {
 /** Cap on un-reviewed proposals per user — stops a chatty or hostile app
  * from burying the review queue (and from filling KV). */
 export const MAX_PENDING = 100;
+
+/** Cap on a single proposed fact. An entry that doesn't fit is usually two
+ * entries, or a summary that should have been trimmed. */
+export const MAX_FACT_CHARS = 500;

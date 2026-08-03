@@ -9,7 +9,9 @@
     "start": "wrangler dev",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "publish-open": "node scripts/publish-open.mjs"
+    "test": "esbuild src/app.ts --bundle --format=esm --platform=neutral --outfile=/tmp/helix-app.mjs && node uxtest.mjs",
+    "publish-open": "node scripts/publish-open.mjs",
+    "restore": "node scripts/restore.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "^0.8.2",

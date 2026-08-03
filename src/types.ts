@@ -46,4 +46,9 @@ export interface HelixProps extends Record<string, unknown> {
   email: string;
   clientName: string;
   scopes: string[];
+  /** Labels this grant is limited to. Absent = the whole granted category.
+   * Carried in grant props rather than in the scope strings: compound scopes
+   * like "work:helix" get unreadable fast, and this keeps the narrowing
+   * decision next to the grant the owner actually approved. */
+  labels?: string[];
 }
