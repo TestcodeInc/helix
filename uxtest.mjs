@@ -299,6 +299,12 @@ await kv.put("audit:dave", JSON.stringify([
 r = await req("/owner/audit", { headers: { Authorization: `Bearer ${devTok}` } });
 j = await r.json();
 check("owner audit returns entries", Array.isArray(j.audit) && j.audit.length > 0);
+// The apps decode `chain.status` as a non-optional string. Shipping the raw
+// internal shape broke the whole response, list included — found on a real
+// phone, so the contract gets asserted here from now on.
+check("the chain verdict has the status string clients decode", typeof j.chain?.status === "string");
+check("and a verified count", typeof j.chain?.verified === "number");
+check("a log with no chained entries reads as unverified, not intact", j.chain.status === "unverified");
 r = await req("/owner/connections", { headers: { Authorization: `Bearer ${devTok}` } });
 j = await r.json();
 check("owner connections: grants + devices with current flag", Array.isArray(j.grants) && j.devices?.[0]?.is_current === true);
@@ -629,6 +635,59 @@ await kv.put("pending:fay", JSON.stringify([dupe]));
 await post("/review/decide", { id: "dup1", action: "approve" }, fcookie);
 const dupeVault = JSON.parse(store.get("vault:fay"));
 check("approving twice adds the fact only once", dupeVault.relationships.learned.filter((l) => l.fact === dupe.fact).length === 1);
+
+// ---- pairing a phone from an authenticated session ---------------------
+// The passphrase never reaches the second device: the web session mints a
+// short-lived, single-use code, and the phone trades it for a device token.
+const pairHtml = await (await req("/connections/pair", { headers: { Cookie: fcookie } })).text();
+const pairCode = (pairHtml.match(/letter-spacing:\.22em;margin:0">([A-Z0-9]{8})</) ?? [])[1];
+check("pair page mints a code", !!pairCode);
+check("pair page renders a QR alongside it", pairHtml.includes("qrcode.min.js") && pairHtml.includes("/p/" + pairCode));
+check("and says the passphrase stays put", pairHtml.includes("passphrase never leaves"));
+check("pairing needs a session", (await req("/connections/pair", { redirect: "manual" })).status === 302);
+
+let st = await (await req(`/connections/pair/status?code=${pairCode}`, { headers: { Cookie: fcookie } })).json();
+check("a fresh code reads as waiting", st.status === "waiting");
+
+const jsonPost = (path, obj, token) =>
+  req(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body: JSON.stringify(obj),
+  });
+
+r = await jsonPost("/owner/device/claim", { code: "AAAAAAAA", deviceName: "Attacker" });
+check("an unknown code is refused", r.status === 401);
+
+r = await jsonPost("/owner/device/claim", { code: pairCode.toLowerCase(), deviceName: "Fay's iPhone" });
+j = await r.json();
+check("a valid code mints a device token", typeof j.token === "string" && j.token.length === 64);
+check("case and spacing are forgiven", j.name === "Fay");
+const pairedTok = j.token;
+
+r = await jsonPost("/owner/device/claim", { code: pairCode, deviceName: "Second phone" });
+check("a code works exactly once", r.status === 401);
+
+// A scanner hands over whatever the QR encoded — a URL, not a bare code.
+// Recovering it server-side means every client works, not just ours.
+const { pairing: PAIR } = await import("/tmp/helix-app.mjs");
+check("a scanned URL yields the code", PAIR.normalizeCode("https://vault.helix.ai/p/ABCD2345") === "ABCD2345");
+check("a typed code still works", PAIR.normalizeCode("abcd 2345") === "ABCD2345");
+check("look-alike characters are forgiven", PAIR.normalizeCode("ABCDO23I") === "ABCD0231");
+
+const scan = await (await req("/connections/pair", { headers: { Cookie: fcookie } })).text();
+const scanCode = (scan.match(/letter-spacing:\.22em;margin:0">([A-Z0-9]{8})</) ?? [])[1];
+r = await jsonPost("/owner/device/claim", { code: `https://vault.helix.ai/p/${scanCode}`, deviceName: "Scanned phone" });
+check("claiming with the scanned URL works end to end", r.status === 200 && typeof (await r.json()).token === "string");
+
+st = await (await req(`/connections/pair/status?code=${pairCode}`, { headers: { Cookie: fcookie } })).json();
+check("the web page learns it was claimed", st.status === "claimed" && st.name === "Fay's iPhone");
+
+r = await req("/owner/pending", { headers: { Authorization: `Bearer ${pairedTok}` } });
+check("the paired token actually works", r.status === 200);
+const connAfterPair = await (await req("/connections", { headers: { Cookie: fcookie } })).text();
+check("the paired device is listed and revocable", connAfterPair.includes("Fay&#39;s iPhone") || connAfterPair.includes("Fay's iPhone"));
+check("pairing is written to the audit log", JSON.parse(store.get("audit:fay")).some((e) => e.detail.includes("paired a new device")));
 
 // ---- the owner's own actions are audited too ---------------------------
 // Found by dogfooding: approvals were never logged, so the audit trail

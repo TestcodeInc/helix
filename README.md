@@ -55,6 +55,7 @@ or the next publish will stop and tell you.
 | `subjects.ts` | Likeness: subjects, photos, thumbnails. Source photos never cross the app door |
 | `voice.ts` | Voice takes, live-phrase verification, provider voice compilation |
 | `devices.ts` | Owner-door device tokens (hashed) and APNs registration |
+| `pairing.ts` | Short-lived single-use codes so a phone can be paired without typing the passphrase |
 | `usage.ts` | Monthly generation caps; per-user overrides in KV |
 | `ratelimit.ts` | IP buckets and Turnstile |
 | `email.ts` | Transactional mail (Resend); optional |

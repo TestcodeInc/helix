@@ -61,6 +61,7 @@ import { emailConfigured, sendVerification, sendReset } from "./email";
 import { rateLimit, clientId, verifyTurnstile, turnstileWidget } from "./ratelimit";
 import { runBackup } from "./backup";
 import { userActivity, activitySummary } from "./activity";
+import { mintPairingCode, claimPairingCode, pairingStatus, claimedName } from "./pairing";
 import { checkExport, importExport, importSummary, MAX_IMPORT_BYTES } from "./importer";
 import {
   loadLabels,
@@ -1029,6 +1030,7 @@ ${await (async () => {
   if (devices.length === 0) return "";
   return `<h2>Your devices</h2>
 <p class="muted">Owner devices signed in with your passphrase — they can approve and reject learnings${devices.some((d) => d.hasPush) ? ", and get push notifications" : ""}.</p>
+<p><a href="/connections/pair">Pair another phone →</a></p>
 ${devices
   .map(
     (d) => `<div class="card row">
@@ -2144,6 +2146,134 @@ app.post("/owner/login", async (c) => {
   return c.json({ token, name: user.name });
 });
 
+
+// ---------- pairing a phone ----------
+
+/**
+ * Show a code (and a QR of it) that a phone can exchange for a device token.
+ *
+ * Deliberately reachable from /connections rather than buried in onboarding:
+ * people replace phones, add a second one, or decide months later that they
+ * want notifications.
+ */
+app.get("/connections/pair", async (c) => {
+  const user = await sessionUser(c);
+  if (!user) return c.redirect("/login");
+  const { code, expiresIn } = await mintPairingCode(c.env.VAULT_KV, user.id);
+  const origin = new URL(c.req.url).origin;
+  // The QR carries a normal https URL: scanned without the app installed it
+  // lands on a page that explains itself, rather than failing silently on a
+  // custom scheme nothing has registered.
+  const payload = `${origin}/p/${code}`;
+
+  return c.html(
+    page(
+      "Pair your phone — Helix",
+      `${await navFor(c, user)}<h1>Pair your phone</h1>
+<p class="muted">Open the Helix app, choose <strong>Connect this phone</strong>, and point the camera here. Or type the code. Your passphrase never leaves this browser.</p>
+<div class="card" style="text-align:center">
+  <div id="qr" style="display:flex;justify-content:center;margin:6px 0 14px"></div>
+  <p style="font-family:var(--font-mono);font-size:1.7em;letter-spacing:.22em;margin:0">${esc(code)}</p>
+  <p class="muted" id="status">Expires in <span id="left">${Math.floor(expiresIn / 60)}:00</span>. Waiting for your phone…</p>
+</div>
+<p class="muted">Paired devices appear on your <a href="/connections">connections</a> page, and can be revoked there at any time. A code works once.</p>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script>
+(function () {
+  var code = ${JSON.stringify(code)};
+  try {
+    new QRCode(document.getElementById('qr'), {
+      text: ${JSON.stringify(payload)},
+      width: 190, height: 190,
+      colorDark: '#0b0b0f', colorLight: '#ffffff',
+    });
+  } catch (e) { /* the code below the QR is the fallback */ }
+
+  var left = ${expiresIn};
+  var leftEl = document.getElementById('left');
+  var statusEl = document.getElementById('status');
+  var tick = setInterval(function () {
+    left--;
+    if (left <= 0) { clearInterval(tick); clearInterval(poll);
+      statusEl.innerHTML = 'This code has expired. <a href="/connections/pair">Get a new one</a>.'; return; }
+    leftEl.textContent = Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0');
+  }, 1000);
+
+  var poll = setInterval(async function () {
+    try {
+      var r = await fetch('/connections/pair/status?code=' + encodeURIComponent(code));
+      var j = await r.json();
+      if (j.status === 'claimed') {
+        clearInterval(poll); clearInterval(tick);
+        document.querySelector('#qr').innerHTML = '';
+        statusEl.innerHTML = '<strong>' + (j.name || 'Your phone') + ' is paired.</strong> ' +
+          '<a href="/connections">See your devices</a>.';
+      }
+    } catch (e) { /* keep polling */ }
+  }, 2000);
+})();
+</script>`,
+    ),
+  );
+});
+
+app.get("/connections/pair/status", async (c) => {
+  const user = await sessionUser(c);
+  if (!user) return c.json({ error: "unauthorized" }, 401);
+  const code = c.req.query("code") ?? "";
+  const status = await pairingStatus(c.env.VAULT_KV, code);
+  return c.json({ status, name: status === "claimed" ? await claimedName(c.env.VAULT_KV, code) : null });
+});
+
+/** Landing page for a scanned QR — useful when the app isn't installed yet. */
+app.get("/p/:code", (c) =>
+  c.html(
+    page(
+      "Pair — Helix",
+      `<h1>Pair this device</h1>
+<div class="card">
+  <p>Open the Helix app and enter this code:</p>
+  <p style="font-family:var(--font-mono);font-size:1.7em;letter-spacing:.22em">${esc(c.req.param("code"))}</p>
+  <p class="muted">Codes expire a few minutes after they're created. If this one has, generate another from Connections in your vault.</p>
+</div>`,
+    ),
+  ),
+);
+
+/**
+ * The owner door's half. Unauthenticated by necessity — the code IS the
+ * authorisation — so it's rate limited, and a wrong code says nothing about
+ * whether it ever existed.
+ *
+ * Path matches what the iOS and Android clients already call
+ * (`owner/device/claim`); the server was the newer half, so it moved.
+ */
+app.post("/owner/device/claim", async (c) => {
+  if (!(await rateLimit(c.env.VAULT_KV, "ownerclaim", clientId(c.req.raw), 12, 900))) {
+    return c.json({ error: "Too many attempts. Try again in a few minutes." }, 429);
+  }
+  const body = (await c.req.json().catch(() => null)) as {
+    code?: string;
+    deviceName?: string;
+  } | null;
+  if (!body?.code) return c.json({ error: "code required" }, 400);
+
+  const deviceName = body.deviceName?.slice(0, 60) || "Phone";
+  const record = await claimPairingCode(c.env.VAULT_KV, body.code, deviceName);
+  if (!record) return c.json({ error: "That code has expired or was already used." }, 401);
+
+  const user = await getUser(c.env.VAULT_KV, record.userId);
+  if (!user) return c.json({ error: "unknown user" }, 404);
+
+  const token = await createDevice(c.env.VAULT_KV, record.userId, deviceName);
+  await appendAudit(c.env.VAULT_KV, record.userId, {
+    client: `You (${deviceName})`,
+    action: "write",
+    detail: `paired a new device from the web`,
+  });
+  return c.json({ token, name: user.name });
+});
+
 app.get("/owner/pending", async (c) => {
   const device = await ownerFromBearer(c);
   if (!device) return c.json({ error: "unauthorized" }, 401);
@@ -2497,7 +2627,24 @@ app.get("/owner/audit", async (c) => {
   const audit = await readAudit(c.env.VAULT_KV, device.userId);
   // The phone gets the same verdict as the web page — a trust claim that only
   // holds on one screen isn't one.
-  return c.json({ audit: audit.slice(0, 100), chain: await verifyAuditChain(audit) });
+  //
+  // Shaped for the clients rather than mirroring the internal type: they need
+  // a `status` string they can render directly, and "no chained entries yet"
+  // is a third answer, not a quiet "intact". The internal fields ride along
+  // so a debugging session doesn't need a second endpoint.
+  const chain = await verifyAuditChain(audit);
+  const status = !chain.ok ? "broken" : chain.checked === 0 ? "unverified" : "intact";
+  return c.json({
+    audit: audit.slice(0, 100),
+    chain: {
+      status,
+      verified: chain.checked,
+      brokenAt: chain.brokenAt ?? null,
+      reason: chain.reason ?? null,
+      ok: chain.ok,
+      checked: chain.checked,
+    },
+  });
 });
 
 app.get("/owner/connections", async (c) => {
@@ -2563,6 +2710,7 @@ export { entryId, normalizeVault } from "./vault";
 export { verifyAuditChain, auditHash, appendAudit } from "./vault";
 export * as labels from "./labels";
 export * as toolsig from "./toolsig";
+export * as pairing from "./pairing";
 export * as activity from "./activity";
 export { compileError as compileErrorForTest } from "./voice";
 export { runBackup } from "./backup";

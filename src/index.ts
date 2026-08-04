@@ -50,7 +50,7 @@ import { toolSignature, shouldAnnounce } from "./toolsig";
  * clients that would otherwise sit on a cached tool list until someone
  * reconnected by hand.
  */
-const TOOLSET_VERSION = 3; // 3: propose_learning gained `labels`; 2: propose_labels
+const TOOLSET_VERSION = 4; // 4: empty-vault onboarding offer; 3: propose_learning `labels`
 
 export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
   server = new McpServer(
@@ -175,6 +175,25 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
           if (asked?.length && !index.some((l) => l.label === asked[0])) {
             text += `\nNote: no entries carry the label "${asked[0]}", so nothing was returned for it.`;
           }
+          /**
+           * A nearly-empty vault is the product's weakest moment: nothing to
+           * read, so nothing to demonstrate, and a form to fill in before
+           * anything works. But the assistant on the other end of this call
+           * has usually known the user for months. Ask it to offer.
+           *
+           * Deliberately an offer rather than an instruction to act: twenty
+           * facts arriving unrequested would be exactly the silent capture
+           * this product exists to object to. The user says yes first.
+           */
+          const entryCount = CATEGORIES.reduce(
+            (n, c) => n + vault[c].base.length + vault[c].learned.length,
+            0,
+          );
+          if (entryCount <= 4 && pending.length === 0) {
+            text +=
+              "\n\n---\nThis vault is nearly empty, so the user is probably new to Helix. Tell them, in your own words, that you can help fill it: you already know things about them from your conversations, and you can propose those as facts for them to approve or reject. Ask first. If they agree, propose what you genuinely know — one propose_learning call per fact, spread across the categories above, and only things you are actually confident about. Say plainly that some of it may surprise them, that nothing is saved until they approve it, and that rejecting is as useful as approving.";
+          }
+
           text +=
             "\n\nStanding instructions — do not ask permission first, proposals are safe (the user approves or rejects each one in their review queue):\n" +
             "1. When this conversation surfaces a durable fact that is missing or outdated above, call propose_learning immediately. If it CORRECTS an entry above, pass that entry's id as \"replaces\" — a correction proposed without it leaves the vault holding both versions.\n" +

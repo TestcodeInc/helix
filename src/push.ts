@@ -64,17 +64,40 @@ export async function notifyPending(
   const host =
     env.APNS_ENV === "production" ? "api.push.apple.com" : "api.sandbox.push.apple.com";
   const jwt = await apnsJwt(env);
+  /**
+   * One notification, not one per fact.
+   *
+   * An assistant asked to populate an empty vault can propose twenty facts in
+   * a row. Sent naively that is twenty buzzes during someone's first ten
+   * minutes with the product — the opposite of the calm this is supposed to
+   * feel like. APNs solves it properly: notifications sharing a collapse id
+   * replace each other on the device, so a burst shows up as a single,
+   * updating notification.
+   *
+   * A lone proposal still quotes the fact, because that's what makes an
+   * approve-from-the-lock-screen decision possible without opening anything.
+   */
+  const burst = pendingCount > 1;
+  const collapseId = `helix-review-${userId}`.slice(0, 64);
   const payload = JSON.stringify({
     aps: {
-      alert: {
-        title: `${entry.client} wants to remember`,
-        body: `“${entry.fact.slice(0, 140)}”`,
-      },
+      alert: burst
+        ? {
+            title: "Waiting for your review",
+            body: `${pendingCount} proposed memories, the latest from ${entry.client}.`,
+          }
+        : {
+            title: `${entry.client} wants to remember`,
+            body: `“${entry.fact.slice(0, 140)}”`,
+          },
       badge: pendingCount,
       category: "HELIX_REVIEW",
       sound: "default",
+      "thread-id": "helix-review",
     },
-    pendingId: entry.id,
+    // Only useful when there's exactly one thing to decide; a burst opens the
+    // queue instead.
+    ...(burst ? {} : { pendingId: entry.id }),
   });
 
   await Promise.all(
@@ -87,6 +110,8 @@ export async function notifyPending(
             "apns-topic": env.APNS_BUNDLE_ID!,
             "apns-push-type": "alert",
             "apns-priority": "10",
+            // Replaces the previous review notification rather than stacking.
+            "apns-collapse-id": collapseId,
           },
           body: payload,
         });
