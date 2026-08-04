@@ -972,6 +972,28 @@ app.post("/authorize", async (c) => {
     ),
   ];
 
+  /**
+   * Re-consenting REPLACES the previous grant for the same app.
+   *
+   * Two things conspire without this. An app that disconnects on its own side
+   * never tells us, so the grant lingers — OAuth clients aren't obliged to
+   * call back and most don't. And because clients register dynamically, a
+   * reconnect arrives with a brand-new client_id, so it doesn't even look
+   * like the same app. The result is a connections page listing "Claude"
+   * three times, which is precisely the screen that has to be trustworthy.
+   *
+   * Matching therefore falls back to the app's name when the id differs.
+   * Imprecise, but the failure mode is mild (two genuinely different apps
+   * sharing a name, one of which the owner can revoke by hand) and the
+   * alternative is a list nobody can read.
+   */
+  const { items: priorGrants } = await c.env.OAUTH_PROVIDER.listUserGrants(user.id);
+  const supersedes = priorGrants.filter((g) => {
+    if (g.clientId === oauthReq.clientId) return true;
+    const label = (g.metadata as { label?: string } | undefined)?.label ?? "";
+    return label.split(" → ")[0] === clientName;
+  });
+
   const { redirectTo } = await c.env.OAUTH_PROVIDER.completeAuthorization({
     request: oauthReq,
     userId: user.id,
@@ -982,6 +1004,23 @@ app.post("/authorize", async (c) => {
     scope: scopes,
     props: { userId: user.id, email: user.email, clientName, scopes, labels },
   });
+
+  // Only after the new grant exists — a failure here should never leave the
+  // owner with no working connection.
+  for (const g of supersedes) {
+    try {
+      await c.env.OAUTH_PROVIDER.revokeGrant(g.id, user.id);
+    } catch {
+      /* a stale grant is untidy; a broken authorize is worse */
+    }
+  }
+  if (supersedes.length) {
+    await appendAudit(c.env.VAULT_KV, user.id, {
+      client: "You (web)",
+      action: "write",
+      detail: `reconnected ${clientName}, replacing ${supersedes.length} earlier grant${supersedes.length === 1 ? "" : "s"}`,
+    });
+  }
 
   return Response.redirect(redirectTo, 302);
 });

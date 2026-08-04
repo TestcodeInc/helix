@@ -468,6 +468,26 @@ check("the grant carries the label restriction in props", granted?.props?.labels
 check("and in metadata, so /connections can show it", granted?.metadata?.labels?.[0] === "helix");
 await post("/authorize", { oauthreq: btoa(JSON.stringify({ clientId: "x" })), client_name: "Dog Photobooth", email: "fay@test.dev", passphrase: "fay-pass-1234", scopes: "identity" }, fcookie);
 check("no labels chosen means an unrestricted grant", Array.isArray(granted.props.labels) && granted.props.labels.length === 0);
+// Reconnecting must REPLACE, not accumulate. Apps that disconnect on their
+// own side never tell us, and dynamic client registration means a reconnect
+// arrives with a new client_id — so without this the connections page lists
+// the same app several times.
+const revoked = [];
+env.OAUTH_PROVIDER.revokeGrant = async (id) => { revoked.push(id); };
+env.OAUTH_PROVIDER.listUserGrants = async () => ({
+  items: [
+    { id: "old-same-id", clientId: "x", scope: ["identity"], metadata: { label: "Dog Photobooth → fay@test.dev" } },
+    { id: "old-same-name", clientId: "different-after-reregister", scope: ["identity"], metadata: { label: "Dog Photobooth → fay@test.dev" } },
+    { id: "keep-me", clientId: "zzz", scope: ["identity"], metadata: { label: "Some Other App → fay@test.dev" } },
+  ],
+});
+await post("/authorize", { oauthreq: btoa(JSON.stringify({ clientId: "x" })), client_name: "Dog Photobooth", email: "fay@test.dev", passphrase: "fay-pass-1234", scopes: "identity" }, fcookie);
+check("reconnecting revokes the grant with the same client id", revoked.includes("old-same-id"));
+check("and the one that re-registered under a new id", revoked.includes("old-same-name"));
+check("but leaves other apps alone", !revoked.includes("keep-me"));
+check("the replacement is audited", JSON.parse(store.get("audit:fay")).some((e) => e.detail.includes("replacing 2 earlier grants")));
+env.OAUTH_PROVIDER.revokeGrant = async () => {};
+
 env.OAUTH_PROVIDER.listUserGrants = async () => ({ items: [{ id: "g1", clientId: "x", scope: ["identity"], metadata: { label: "Dog Photobooth → fay@test.dev", labels: ["helix"] } }] });
 const connHtml3 = await (await req("/connections", { headers: { Cookie: fcookie } })).text();
 check("connections shows what the app is limited to", connHtml3.includes("limited to") && connHtml3.includes(">helix<"));
