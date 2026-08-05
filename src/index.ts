@@ -50,12 +50,57 @@ import { toolSignature, shouldAnnounce } from "./toolsig";
  * clients that would otherwise sit on a cached tool list until someone
  * reconnected by hand.
  */
-const TOOLSET_VERSION = 4; // 4: empty-vault onboarding offer; 3: propose_learning `labels`
+const TOOLSET_VERSION = 5; // 5: server instructions + catch_up_my_vault prompt; 4: empty-vault onboarding offer; 3: propose_learning `labels`
+
+/**
+ * Server-level instructions, returned at initialize.
+ *
+ * The only surface Helix has *before* anything calls a tool. Every other hint
+ * we give — the "ALWAYS call this" in get_context, the supersession note on a
+ * propose response — arrives inside a tool result, which means it only ever
+ * reaches a model that already decided to use the vault. That is a loop with
+ * no start.
+ *
+ * The failure is real and was found by using it: a long session that covered
+ * a career change, a compensation target and an employment agreement produced
+ * exactly zero proposals, because nothing in it happened to touch the vault.
+ * Nothing was wrong with the tool descriptions. They were never read.
+ *
+ * This is still the elegant fix and it must not be load-bearing. A client can
+ * ignore instructions entirely, or defer the whole server and never surface it
+ * — which is precisely what happened. The backstop lives in activity.ts, where
+ * the vault notices it is starving and tells the owner, with no model in the
+ * loop at all.
+ *
+ * Deliberately conditional on the tools present. The tool set is built per
+ * grant, but instructions are fixed at construction, before props are known.
+ * A likeness-only connection like a photo app holds neither get_context nor
+ * propose_learning, and telling it to call them would send it hunting for
+ * tools it was never given. Guidance that is wrong for a third of connections
+ * is worse than none, so each habit names its tool and is scoped to sessions
+ * that actually have it.
+ */
+const SERVER_INSTRUCTIONS = `Helix is the user's own context vault: the facts, photos and voice they have chosen to keep about themselves. They own it, they approve everything that enters it, and they can revoke your access at any time — including mid-conversation.
+
+Your session only has the tools this user granted you. Follow whichever of these apply.
+
+IF YOU HAVE get_context — READ IT EARLY. Call it at the start of any substantive conversation, and any time you are about to write as the user, advise them, or assume something about their situation. It is their stated source of truth and it beats guessing.
+
+IF YOU HAVE propose_learning — PROPOSE WHAT YOU LEARN. When the conversation surfaces something durable about them — a decision, a project, a preference, a role change, a relationship, a constraint they are working under — call it. Do this without being asked and without asking permission first. Nothing is saved by proposing: every proposal waits in the user's review queue until they approve or reject it. The cost of a wrong proposal is one tap. The cost of never proposing is a vault that slowly stops describing them.
+
+If a conversation runs long and covers real ground about the user, do not finish it without considering what belongs in their vault.
+
+IF YOU HAVE list_subjects, generate_image or generate_speech — these work on the user's likeness. Their source photos and recordings never enter this conversation; generation happens on the vault and you receive only the finished result. Identify people and pets by name.
+
+You will not have all of these. Do not call a tool you were not given.`;
 
 export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
   server = new McpServer(
     { name: "Helix", version: "0.7.0" },
-    { capabilities: { tools: { listChanged: true } } },
+    {
+      capabilities: { tools: { listChanged: true }, prompts: {} },
+      instructions: SERVER_INSTRUCTIONS,
+    },
   );
 
   /**
@@ -668,6 +713,46 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
             structuredContent: { audio_url: url },
           };
         },
+      );
+    }
+
+    /**
+     * The owner's hand on the trigger.
+     *
+     * Instructions and tool descriptions both depend on a model deciding to
+     * act. This doesn't. In any client that surfaces MCP prompts, the user can
+     * invoke this themselves at the end of a conversation that covered real
+     * ground, and the loop starts from the human side.
+     *
+     * It deliberately asks the assistant to read first. A proposal made
+     * without reading is how you get two entries saying different things about
+     * where someone lives.
+     */
+    if (canPropose) {
+      this.server.registerPrompt(
+        "catch_up_my_vault",
+        {
+          title: "Catch up my Helix vault",
+          description:
+            "Review this conversation for anything durable about me and propose it to my Helix vault for approval.",
+        },
+        () => ({
+          messages: [
+            {
+              role: "user" as const,
+              content: {
+                type: "text" as const,
+                text: `Read my Helix vault with get_context first, so you know what is already there and can supersede rather than duplicate.
+
+Then look back over this whole conversation and propose anything durable you learned about me that isn't already in the vault: decisions I made, projects I'm working on, preferences I expressed, changes in my situation, constraints I'm under, people who matter to me.
+
+Use propose_learning for each one. Keep them short, specific, and in third person. If something updates an existing entry, pass that entry's id as \`replaces\`.
+
+Skip anything that was speculative, that I was only thinking out loud about, or that is obviously sensitive and better left out unless I said otherwise. Everything you propose waits for my approval, so err toward proposing — but tell me briefly what you proposed and what you deliberately left out.`,
+              },
+            },
+          ],
+        }),
       );
     }
 

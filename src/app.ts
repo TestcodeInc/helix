@@ -160,6 +160,7 @@ function page(title: string, body: string): string {
   .replacer select{margin:6px 0 2px;max-width:100%}
   .state{margin:4px 0;font-size:.9em}
   .state--stuck{color:#f0a0b4}
+  .state--starving{color:#e08a5a}
   .state--cold{color:#c9a86a}
   .state--warm{color:#7fd6a8}
   .chip{display:inline-block;background:#22243a;border:1px solid #34375a;color:#9aa0c8;border-radius:999px;padding:1px 8px;font-size:.72em;margin-left:6px;vertical-align:middle}
@@ -723,7 +724,10 @@ async function adminPage(c: Ctx, notice = ""): Promise<Response> {
       users.map(async (u) => [u.id, await userActivity(c.env, u.id)] as const),
     ),
   );
-  const rank = { stuck: 0, cold: 1, warm: 2 } as const;
+  // Starving ranks above cold: a vault being read daily while nothing feeds it
+  // is a live user quietly getting a worse product, which is more urgent than
+  // an idle one.
+  const rank = { stuck: 0, starving: 1, cold: 2, warm: 3 } as const;
   const sorted = [...users].sort((a, b) => {
     const sa = activitySummary(activity.get(a.id)!).state;
     const sb = activitySummary(activity.get(b.id)!).state;
@@ -769,7 +773,9 @@ ${
   <p class="state state--${s.state}">${esc(s.text)}</p>
   <p class="muted">${a.pending} pending${a.oldestPendingDays !== null ? ` (oldest ${a.oldestPendingDays}d)` : ""} · ${a.events} events · ${
     a.lastRead ? `last read ${esc(a.lastRead.at.slice(0, 10))} by ${esc(a.lastRead.client)}` : "never read"
-  } · ${a.lastCurated ? `last curated ${esc(a.lastCurated.slice(0, 10))}` : "never curated"}</p>
+  } · ${a.lastCurated ? `last curated ${esc(a.lastCurated.slice(0, 10))}` : "never curated"} · ${
+    a.lastProposed ? `last proposal ${esc(a.lastProposed.slice(0, 10))}` : "never proposed to"
+  } · ${a.recentReads} reads/14d</p>
   <p class="muted">${a.labelled} labelled · ${a.private} private · ${a.devices} device${a.devices === 1 ? "" : "s"} · images ${a.images.used}/${a.images.limit < 0 ? "∞" : a.images.limit} · speech ${a.speech.used}/${a.speech.limit < 0 ? "∞" : a.speech.limit}</p>
   <div class="row">
     <form method="POST" action="/admin/reset"><input type="hidden" name="userId" value="${esc(u.id)}"><button class="small ghost">New invite link (reset passphrase)</button></form>

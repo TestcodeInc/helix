@@ -834,7 +834,7 @@ check("an unknown replaces id degrades to a plain add", fayGeo2.identity.learned
 const { activity: ACT } = await import("/tmp/helix-app.mjs");
 const ago = (d) => new Date(Date.now() - d * 86_400_000).toISOString();
 
-const blank = { pending: 0, oldestPendingDays: null, lastRead: null, lastCurated: null, labelled: 0, private: 0, devices: 0, images: { used: 0, limit: 20 }, speech: { used: 0, limit: 20 }, events: 0 };
+const blank = { pending: 0, oldestPendingDays: null, lastRead: null, lastCurated: null, lastProposed: null, recentReads: 0, labelled: 0, private: 0, devices: 0, images: { used: 0, limit: 20 }, speech: { used: 0, limit: 20 }, events: 0 };
 check("a user who never connected reads as cold", ACT.activitySummary({ ...blank }).state === "cold" && ACT.activitySummary({ ...blank }).text.includes("never connected"));
 check("events but no reads is still cold", ACT.activitySummary({ ...blank, events: 3 }).text.includes("no app has read"));
 check("a week-old queue is stuck", ACT.activitySummary({ ...blank, events: 9, pending: 4, oldestPendingDays: 9, lastRead: { at: ago(1), client: "Claude" } }).state === "stuck");
@@ -842,6 +842,35 @@ check("and the rot is named, not just flagged", ACT.activitySummary({ ...blank, 
 check("a fresh queue is not stuck", ACT.activitySummary({ ...blank, events: 9, pending: 2, oldestPendingDays: 1, lastRead: { at: ago(0), client: "Claude" }, lastCurated: ago(1) }).state === "warm");
 check("two weeks silent goes cold again", ACT.activitySummary({ ...blank, events: 9, lastRead: { at: ago(20), client: "ChatGPT" } }).state === "cold");
 check("reading without ever approving is called out", ACT.activitySummary({ ...blank, events: 5, lastRead: { at: ago(1), client: "Claude" } }).text.includes("never approved"));
+
+// ---- the starving vault -------------------------------------------------
+//
+// A vault can pass every other check — connected, read daily, queue empty,
+// owner responsive — while quietly ceasing to be true about the person,
+// because assistants read it and never propose back. An empty queue looks
+// identical to "nothing has been proposed in a month", which is why this
+// needs its own state rather than being inferable from the others.
+//
+// Found by using the product: a day-long conversation about a career change,
+// a compensation target and an employment agreement produced zero proposals.
+// Every model-side hint we ship lives inside a tool result, so it only ever
+// reaches a model that already decided to call a tool. This check needs no
+// model, which is the entire point of it.
+const busy = { ...blank, events: 40, recentReads: 12, lastRead: { at: ago(0), client: "Claude" }, lastCurated: ago(30) };
+
+check("reads daily, nothing proposed in a month — starving", ACT.activitySummary({ ...busy, lastProposed: ago(30) }).state === "starving");
+check("and the number is named, not just the state", ACT.activitySummary({ ...busy, lastProposed: ago(30) }).text.includes("12 reads in 14 days"));
+check("never proposed to at all is starving too", ACT.activitySummary({ ...busy, lastProposed: null }).state === "starving");
+
+// The boundaries. Each of these is a way the check could fire wrongly.
+check("a recent proposal is not starving", ACT.activitySummary({ ...busy, lastProposed: ago(3) }).state === "warm");
+check("a pending item means something is contributing", ACT.activitySummary({ ...busy, lastProposed: ago(60), pending: 1, oldestPendingDays: 1 }).state === "warm");
+check("an idle vault is cold, not starving — nobody is using it to starve", ACT.activitySummary({ ...blank, events: 9, recentReads: 0, lastRead: { at: ago(20), client: "Claude" }, lastCurated: ago(20), lastProposed: null }).state === "cold");
+check("a couple of reads is too thin to call", ACT.activitySummary({ ...busy, recentReads: 2, lastProposed: null }).state === "warm");
+check("a rotting queue still outranks starving", ACT.activitySummary({ ...busy, pending: 5, oldestPendingDays: 20, lastProposed: ago(20) }).state === "stuck");
+check("never having curated is still reported first", ACT.activitySummary({ ...busy, lastCurated: null, lastProposed: null }).text.includes("never approved"));
+
+check("isStarving is exported for reuse", typeof ACT.isStarving === "function" && ACT.isStarving({ ...busy, lastProposed: ago(30) }) === true);
 
 await kv.put("audit:fay", JSON.stringify([
   { at: ago(2), client: "Claude", action: "read", detail: "identity", seq: 2, hash: "h2", prev: "h1" },
