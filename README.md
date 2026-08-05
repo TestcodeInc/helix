@@ -27,20 +27,20 @@ Helix pays for itself.
 
 Self-hosting guide: [helix.ai/docs/self-host](https://helix.ai/docs/self-host).
 
-### Publishing the open repo
+### This repo is generated
 
-This repo is private and is the source of truth — you develop here and deploy
-from here. The public repo is generated from it:
+This tree is produced automatically from the private repo where Helix is
+developed and deployed from. **Changes committed here are overwritten by the
+next sync**, so a pull request against this repo will disappear rather than
+land. That isn't a policy about contributions, it's a mechanical consequence,
+and it's worth knowing before you spend an evening on a patch.
 
-```sh
-npm run publish-open -- ../helix --commit
-```
+Issues and patches are welcome — open an issue here, or mail
+[hello@helix.ai](mailto:hello@helix.ai) and we'll apply it upstream with
+attribution. The spec at [helix.ai/docs/spec](https://helix.ai/docs/spec) is
+the stable surface; if you're reimplementing rather than patching, work from
+that.
 
-The script exports the tracked tree, drops `src/api.ts`, removes every region
-marked `COMMERCIAL-ONLY-START` … `COMMERCIAL-ONLY-END`, and refuses to write
-anything if a stray `./api` import survived. It never pushes — review the diff
-first. **If you add code that touches the app door, wrap it in those markers**,
-or the next publish will stop and tell you.
 
 ## Layout
 
