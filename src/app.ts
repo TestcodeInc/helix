@@ -1708,6 +1708,7 @@ app.get("/privacy", async (c) =>
 
 <h2>What we hold</h2>
 <p>Only what you put in your vault, plus what's needed to run it: your name, email, a hash of your passphrase (never the passphrase), the facts you write or approve, photos and voice recordings you add as subjects, and the audit log of which apps read what.</p>
+<p>If you use the phone app, also a hash of that device's token and the name you gave it, and — only if you allow notifications — the push token Apple issues for your device.</p>
 
 <h2>What we never do</h2>
 <ul>
@@ -1719,7 +1720,7 @@ app.get("/privacy", async (c) =>
 
 <h2>Who else sees anything</h2>
 <p>Apps you explicitly connect, limited to the categories you check on the consent screen. You can see every access on your audit page and cut any app off instantly from your connections page.</p>
-<p>Two service providers process data on our behalf: <strong>Cloudflare</strong> (hosting and storage) and, only when you generate an image or speech, the <strong>image or voice provider named on that request</strong> (currently OpenAI and ElevenLabs), which receives the reference material for that single request. Transactional email goes through <strong>Resend</strong>.</p>
+<p>A short list of service providers process data on our behalf: <strong>Cloudflare</strong> (hosting and storage) and, only when you generate an image or speech, the <strong>image or voice provider named on that request</strong> (currently OpenAI and ElevenLabs), which receives the reference material for that single request. Transactional email goes through <strong>Resend</strong>, and push notifications are delivered by <strong>Apple</strong>. All four are processors acting on our instructions, and none of them is permitted to use your data for their own purposes.</p>
 
 <h2>Your controls</h2>
 <ul>
@@ -1731,7 +1732,13 @@ app.get("/privacy", async (c) =>
 </ul>
 
 <h2>Retention</h2>
-<p>Vault contents stay until you delete them. Generated images and audio expire after 24 hours. The audit log keeps the most recent 200 events. Deleting your account removes all of it, including generated media, and cannot be undone.</p>
+<p>Vault contents stay until you delete them. Generated images and audio expire after 24 hours. The audit log keeps the most recent 200 events.</p>
+<p>Deleting your vault takes effect immediately and can't be undone: every entry, photo, recording and audit row is gone from the service at once, and every app's access is revoked in the same moment. There's no grace period and nothing to ask us for.</p>
+<p>One honest caveat, because you'd rather hear it from us. We take a nightly backup so that a bug on our side can't lose your vault, and those backups are kept for 30 days before they're overwritten. So for up to 30 days after you delete, a copy exists in that backup. We don't read it, it isn't reachable by any app or by the live service, and it ages out on its own. Nothing you add after deleting is affected.</p>
+
+<h2>Using Helix on a phone</h2>
+<p>The Helix app signs a phone in as a device you own, either by scanning a pairing code from a browser you're already signed into or with your passphrase. That device gets its own token, stored in the iOS keychain, which you can revoke from your connections page at any time. It is not your passphrase and it can't be used to change your passphrase.</p>
+<p>If you turn on notifications, Apple gives us a push token so we can tell you a proposal is waiting. Notifications name the app and quote the fact; they carry nothing else from your vault. The app caches only what it needs to draw the screen you're on, and signing out clears it.</p>
 
 <h2>Children</h2>
 <p>Helix isn't for people under 16. Subjects you add who are minors are your responsibility as their parent or guardian.</p>
@@ -1751,17 +1758,20 @@ app.get("/terms", async (c) =>
 
 <h2>The deal</h2>
 <p>Helix stores personal context you choose to give it and shares it only with apps you authorize. Helix is free during the beta. Your vault is yours: you can export it or delete it at any time.</p>
+<p>You need to be 16 or older to keep a vault. Everything here applies the same whether you're using Helix in a browser, on a phone, or through an AI assistant — it's one vault and one account, and the app is a way into it rather than a separate service.</p>
 
 <h2>Your side</h2>
 <ul>
 <li>Add likeness only for yourself, for people who have agreed, or for those you're the parent or guardian of. Don't vault someone else's face or voice without their consent.</li>
-<li>Don't use Helix to impersonate anyone, to make misleading media of real people, or for anything illegal.</li>
+<li>Don't use Helix to impersonate anyone, to make misleading media of real people, or for anything illegal. If you publish something Helix generated of a real person, say that it was generated — in some places that's the law, and everywhere it's the decent thing.</li>
 <li>Keep your passphrase to yourself. We can't recover it, though you can reset it by email.</li>
+<li>Pair a phone only with a device you control, and revoke it from your connections page if you lose it. A paired device can read and change your vault.</li>
 <li>Don't attack the service or try to reach other people's vaults.</li>
 </ul>
 
 <h2>Our side</h2>
 <p>We run the service with care but make no warranty — this is a beta, and you shouldn't put anything in your vault that you can't afford to lose. Keep your own copies of photos and recordings that matter. Our liability is limited to what you've paid us, which during the beta is nothing.</p>
+<p>We keep the promises the product makes: apps never receive your source photos or recordings, nothing enters your vault without your approval, every access is logged where you can read it, and revocation takes effect immediately. If we ever can't keep one of those, we'll say so here rather than quietly stop doing it.</p>
 <p>We may suspend accounts that abuse the service or violate the rules above. If we ever shut the service down, we'll give notice and an export window.</p>
 
 <h2>Changes</h2>
@@ -2358,9 +2368,18 @@ app.get("/owner/vault", async (c) => {
   const device = await ownerFromBearer(c);
   if (!device) return c.json({ error: "unauthorized" }, 401);
   const owner = await getUser(c.env.VAULT_KV, device.userId);
-  const vault = await loadVault(c.env.VAULT_KV, device.userId, {
-    name: owner?.name,
-    email: owner?.email,
+  const [vault, labelDoc] = await Promise.all([
+    loadVault(c.env.VAULT_KV, device.userId, { name: owner?.name, email: owner?.email }),
+    loadLabels(c.env.VAULT_KV, device.userId),
+  ]);
+  // The sidecar has to come back with the entries. Without it the app can
+  // write a private flag and then has no way to know it exists, so the switch
+  // springs back on the next load and the owner reasonably concludes the
+  // feature is broken. A control you can set but not see is worse than no
+  // control, on this screen most of all.
+  const marks = (id: string) => ({
+    labels: labelDoc.labels[id] ?? [],
+    priv: labelDoc.private.includes(id),
   });
   return c.json({
     categories: CATEGORIES.map((cat) => ({
@@ -2368,13 +2387,14 @@ app.get("/owner/vault", async (c) => {
       label: CATEGORY_META[cat].label,
       hint: CATEGORY_META[cat].hint,
       placeholder: CATEGORY_META[cat].ph,
-      base: vault[cat].base.map((text) => ({ id: entryIdOf(cat, "base", text), text })),
-      learned: vault[cat].learned.map((l) => ({
-        id: entryIdOf(cat, "learned", l.fact),
-        fact: l.fact,
-        source: l.source,
-        date: l.date,
-      })),
+      base: vault[cat].base.map((text) => {
+        const id = entryIdOf(cat, "base", text);
+        return { id, text, ...marks(id) };
+      }),
+      learned: vault[cat].learned.map((l) => {
+        const id = entryIdOf(cat, "learned", l.fact);
+        return { id, fact: l.fact, source: l.source, date: l.date, ...marks(id) };
+      }),
     })),
   });
 });
@@ -2438,6 +2458,105 @@ app.post("/owner/vault/delete", async (c) => {
     action: "write",
     detail: `deleted a ${hit.category} entry`,
   });
+  return c.json({ ok: true });
+});
+
+/**
+ * Mark an entry private, or un-mark it.
+ *
+ * Un-marking is the dangerous direction: it exposes an entry to every app
+ * holding that category. The client gates it behind a confirm, and the audit
+ * line says which way it went, because "became visible" is the event an owner
+ * would want to find later.
+ */
+app.post("/owner/vault/private", async (c) => {
+  const device = await ownerFromBearer(c);
+  if (!device) return c.json({ error: "unauthorized" }, 401);
+  const body = (await c.req.json().catch(() => null)) as {
+    id?: string;
+    private?: boolean;
+  } | null;
+  if (!body?.id || typeof body.private !== "boolean")
+    return c.json({ error: "id and private (boolean) required" }, 400);
+
+  // Refuse ids that aren't in the vault. Without this the sidecar accumulates
+  // flags for entries that no longer exist, and the owner is told something
+  // was marked private when nothing was.
+  const vault = await loadVault(c.env.VAULT_KV, device.userId);
+  const hit = findEntry(vault, body.id);
+  if (!hit) return c.json({ error: "entry not found (it may have changed — refresh)" }, 404);
+
+  await setPrivate(c.env.VAULT_KV, device.userId, body.id, body.private);
+  await appendAudit(c.env.VAULT_KV, device.userId, {
+    client: `You (${device.deviceName})`,
+    action: "write",
+    detail: body.private
+      ? `marked a ${hit.category} entry private — no app can read it`
+      : `removed private from a ${hit.category} entry — apps granted ${hit.category} can now read it`,
+  });
+  return c.json({ ok: true, private: body.private });
+});
+
+/** Replace the label set on an entry. Labels narrow, never widen. */
+app.post("/owner/vault/labels", async (c) => {
+  const device = await ownerFromBearer(c);
+  if (!device) return c.json({ error: "unauthorized" }, 401);
+  const body = (await c.req.json().catch(() => null)) as {
+    id?: string;
+    labels?: unknown;
+  } | null;
+  if (!body?.id || !Array.isArray(body.labels))
+    return c.json({ error: "id and labels[] required" }, 400);
+
+  const vault = await loadVault(c.env.VAULT_KV, device.userId);
+  const hit = findEntry(vault, body.id);
+  if (!hit) return c.json({ error: "entry not found (it may have changed — refresh)" }, 404);
+
+  // setLabels normalises, dedupes and caps; return what actually stuck so the
+  // client shows the truth rather than what it asked for.
+  const applied = await setLabels(
+    c.env.VAULT_KV,
+    device.userId,
+    body.id,
+    body.labels.map((l) => String(l)),
+  );
+  await appendAudit(c.env.VAULT_KV, device.userId, {
+    client: `You (${device.deviceName})`,
+    action: "write",
+    detail: applied.length
+      ? `labelled a ${hit.category} entry: ${applied.join(", ")}`
+      : `removed all labels from a ${hit.category} entry`,
+  });
+  return c.json({ ok: true, labels: applied });
+});
+
+/**
+ * Delete the whole vault from a paired device.
+ *
+ * The web form asks for the passphrase. This one can't: the entire point of
+ * pairing is that the passphrase never gets typed on a phone, and a QR-paired
+ * owner may never have typed it on this device at all. Requiring it here would
+ * either reintroduce that risk or make deletion unreachable — and App Store
+ * guideline 5.1.1(v) requires it to be reachable in the app.
+ *
+ * So the gate is a typed confirmation, and the real protection is the one that
+ * was always doing the work: the device token itself, which the owner minted
+ * from an authenticated session and can revoke from /connections.
+ */
+app.post("/owner/vault/destroy", async (c) => {
+  const device = await ownerFromBearer(c);
+  if (!device) return c.json({ error: "unauthorized" }, 401);
+  const body = (await c.req.json().catch(() => null)) as { confirm?: string } | null;
+  if (body?.confirm !== "DELETE")
+    return c.json({ error: 'confirm must be the string "DELETE"' }, 400);
+
+  const user = await getUser(c.env.VAULT_KV, device.userId);
+  // Already gone. Say so as success: the caller asked for a state, not an
+  // action, and reporting failure would send them looking for a vault that
+  // no longer exists.
+  if (!user) return c.json({ ok: true });
+
+  await purgeUser(c, user);
   return c.json({ ok: true });
 });
 

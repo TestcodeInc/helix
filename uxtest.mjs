@@ -365,6 +365,68 @@ check("owner vault update by entry id", !!edited);
 r = await jpost("/owner/vault/delete", { id: edited.id }, vTok);
 check("owner vault delete", (await r.json()).ok === true);
 
+// 13b. private + labels over the owner door.
+//
+// These exist because the iOS app called three owner routes that were never
+// built, and nothing here noticed. The point of this block is less to test
+// the behaviour than to make the *absence* of a route fail the suite: every
+// endpoint the app calls now has an assertion, so the next one that drifts
+// shows up here rather than in App Review.
+await jpost("/owner/vault/add", { category: "work", text: "Entry to garden" }, vTok);
+j = await (await req("/owner/vault", { headers: { Authorization: `Bearer ${vTok}` } })).json();
+const gardenId = j.categories.find((cAt) => cAt.key === "work").base.find((e) => e.text === "Entry to garden").id;
+
+r = await jpost("/owner/vault/private", { id: gardenId, private: true }, vTok);
+check("owner marks an entry private", r.status === 200 && (await r.json()).private === true);
+check("private flag lands in the sidecar", JSON.parse(store.get("labels:dave")).private.includes(gardenId));
+
+// Round trip. The write worked from day one; GET /owner/vault didn't return
+// the sidecar, so the app set a flag it could never see again and the switch
+// sprang back on reload. A control you can set but not read is worse than no
+// control. Assert the flag comes home.
+j = await (await req("/owner/vault", { headers: { Authorization: `Bearer ${vTok}` } })).json();
+const gardenBack = () =>
+  j.categories.find((cAt) => cAt.key === "work").base.find((e) => e.id === gardenId);
+check("GET /owner/vault reports the private flag", gardenBack()?.priv === true);
+await jpost("/owner/vault/labels", { id: gardenId, labels: ["clinic"] }, vTok);
+j = await (await req("/owner/vault", { headers: { Authorization: `Bearer ${vTok}` } })).json();
+check("GET /owner/vault reports labels", gardenBack()?.labels?.includes("clinic") === true);
+check("entries with no marks still carry empty arrays, not undefined", Array.isArray(gardenBack()?.labels));
+
+r = await jpost("/owner/vault/private", { id: gardenId, private: false }, vTok);
+check("owner un-marks private", (await r.json()).private === false);
+check("un-marking clears the sidecar", !JSON.parse(store.get("labels:dave")).private.includes(gardenId));
+
+r = await jpost("/owner/vault/private", { id: "zzzzzzz", private: true }, vTok);
+check("private on a missing entry is 404, not a silent flag", r.status === 404);
+r = await jpost("/owner/vault/private", { id: gardenId }, vTok);
+check("private requires a boolean", r.status === 400);
+r = await jpost("/owner/vault/private", { id: gardenId, private: true });
+check("private needs the owner token", r.status === 401);
+
+// setLabels normalises and caps at MAX_LABELS_PER_ENTRY (6); the response
+// must report what stuck, not what was asked for.
+r = await jpost("/owner/vault/labels", { id: gardenId, labels: ["Work Stuff", "work stuff", "  ", "a", "b", "c", "d", "e"] }, vTok);
+j = await r.json();
+check("owner labels an entry", r.status === 200 && j.ok === true);
+check("labels are normalised and deduped", j.labels.length <= 6 && new Set(j.labels).size === j.labels.length);
+check("labels land in the sidecar", (JSON.parse(store.get("labels:dave")).labels[gardenId] ?? []).length === j.labels.length);
+
+r = await jpost("/owner/vault/labels", { id: gardenId, labels: [] }, vTok);
+check("empty labels clears the entry", (await r.json()).labels.length === 0);
+r = await jpost("/owner/vault/labels", { id: "zzzzzzz", labels: ["x"] }, vTok);
+check("labels on a missing entry is 404", r.status === 404);
+r = await jpost("/owner/vault/labels", { id: gardenId, labels: "not-an-array" }, vTok);
+check("labels must be an array", r.status === 400);
+
+// Both actions are audited: an entry becoming visible again is exactly the
+// event an owner would go looking for later.
+const gardenAudit = JSON.parse(store.get("audit:dave"));
+check("marking private is audited", gardenAudit.some((a) => a.detail.includes("marked a work entry private")));
+check("un-marking private says it became readable", gardenAudit.some((a) => a.detail.includes("can now read it")));
+check("labelling is audited", gardenAudit.some((a) => a.detail.startsWith("labelled a work entry")));
+await jpost("/owner/vault/delete", { id: gardenId }, vTok);
+
 // 14. self-serve signup, verification, reset
 let sHtml = await (await req("/signup")).text();
 check("signup page renders", sHtml.includes("Create your vault"));
@@ -833,6 +895,32 @@ check("re-hashing a forged entry doesn't help — the next link fails", verdict.
 check("entries written before the chain are reported as unchecked", (await verifyAuditChain([{ at: "2026-01-01T00:00:00Z", client: "Old", action: "read", detail: "identity" }])).checked === 0);
 check("an empty log verifies trivially", (await verifyAuditChain([])).ok === true);
 
+// Frozen test vector for the canonical string.
+//
+// The fields are joined by U+001F, which is non-printing: the source reads
+// `.join("")` in every editor and terminal that doesn't reveal control codes.
+// A seed script reimplemented this "from the spec", got plain concatenation,
+// and produced a log the server rejected. The published spec had the same
+// omission, so it was inviting the mistake.
+//
+// The real danger is the other direction. Someone tidying that line into what
+// it appears to say would invalidate every hash ever written — every existing
+// user's audit page would read "Chain broken", on a screen whose whole job is
+// to be believed. This assertion is the tripwire. If it fails, do not fix the
+// test.
+const { auditHash: AH } = await import("/tmp/helix-app.mjs");
+check(
+  "the audit canonical string is separator-joined (frozen vector)",
+  (await AH({
+    at: "2026-07-27T09:16:00.000Z",
+    client: "You (web)",
+    action: "write",
+    detail: "created the vault",
+    seq: 1,
+    prev: "",
+  })) === "0f00a168235b4fc4ebc52dd079f3737ee06b6a9343e13286d368f23f9abe151a",
+);
+
 // The owner's screens say so.
 await kv.put("audit:fay", JSON.stringify(chainLog));
 const auditHtml2 = await (await req("/audit", { headers: { Cookie: fcookie } })).text();
@@ -851,6 +939,42 @@ check("different scopes are a different signature", sigA !== TS.toolSignature(2,
 check("a first-ever session announces nothing", TS.shouldAnnounce(undefined, sigA) === false);
 check("an unchanged session announces nothing", TS.shouldAnnounce(sigA, sigA) === false);
 check("a deploy that changes the toolset announces", TS.shouldAnnounce(TS.toolSignature(1, ["work"]), TS.toolSignature(2, ["work"])) === true);
+
+// ---- owner-door vault destroy -------------------------------------------
+//
+// Last, and on a throwaway account, because it really does delete everything.
+// App Store guideline 5.1.1(v) requires account deletion to be reachable in
+// the app, so a reviewer WILL run this path. It shipped missing once.
+await post("/signup", { name: "Zoe Gone", email: "zoe@test.dev", passphrase: "correct-horse-battery", passphrase2: "correct-horse-battery" });
+const zoeVerify = [...store.keys()].filter((k) => k.startsWith("verify:")).pop().slice("verify:".length);
+await req(`/verify/${zoeVerify}`, { redirect: "manual" });
+const zoeId = await kv.get("useremail:zoe@test.dev");
+r = await jpost("/owner/login", { email: "zoe@test.dev", passphrase: "correct-horse-battery", deviceName: "Zoe's iPhone" });
+const zTok = (await r.json()).token;
+await jpost("/owner/vault/add", { category: "work", text: "Something to lose" }, zTok);
+
+r = await jpost("/owner/vault/destroy", { confirm: "yes" }, zTok);
+check("destroy refuses anything but the exact word", r.status === 400);
+check("and refusing left the vault alone", !!store.get(`vault:${zoeId}`));
+r = await jpost("/owner/vault/destroy", { confirm: "DELETE" });
+check("destroy needs the owner token", r.status === 401);
+
+r = await jpost("/owner/vault/destroy", { confirm: "DELETE" }, zTok);
+check("owner destroys the vault from a paired device", r.status === 200 && (await r.json()).ok === true);
+check("the vault is gone", !store.get(`vault:${zoeId}`));
+check("the user record is gone", !store.get(`user:${zoeId}`));
+check("the email index is gone, so the address is free again", !store.get("useremail:zoe@test.dev"));
+check("the audit log is gone", !store.get(`audit:${zoeId}`));
+
+// The token was minted against a user that no longer exists. It must stop
+// working — a device that outlives its vault would be a live credential
+// pointing at nothing, and the next signup on that email would inherit it.
+r = await req("/owner/vault", { headers: { Authorization: `Bearer ${zTok}` } });
+check("the paired device's token dies with the vault", r.status === 401);
+
+// Deleting twice is not an error. The caller asked for a state, not an action.
+r = await jpost("/owner/vault/destroy", { confirm: "DELETE" }, zTok);
+check("destroying an already-destroyed vault is unauthorized, not a crash", r.status === 401);
 
 // 6. logged-out guard
 const guard = await req("/vault", { redirect: "manual" });
