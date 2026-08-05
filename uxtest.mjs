@@ -872,6 +872,57 @@ check("never having curated is still reported first", ACT.activitySummary({ ...b
 
 check("isStarving is exported for reuse", typeof ACT.isStarving === "function" && ACT.isStarving({ ...busy, lastProposed: ago(30) }) === true);
 
+// ---- get_context guidance ----------------------------------------------
+//
+// The text get_context returns had no coverage at all until now, because it
+// lived in index.ts and index.ts imports cloudflare:workers. That is how a
+// scope bug survived a full version in the most important tool in the
+// product: a read-only grant was being told to call propose_learning and
+// propose_labels, neither of which it had.
+//
+// It is a pure function now. These assertions are mostly about who is told
+// what, which is the part that was wrong.
+const { guidance: G, normalizeVault: NV } = await import("/tmp/helix-app.mjs");
+const CATS = ["identity", "work", "projects", "preferences", "relationships", "communication-style"];
+const vaultOf = (facts = []) => {
+  const v = NV({});
+  for (const [cat, text] of facts) v[cat].base.push(text);
+  return v;
+};
+const say = (over = {}) =>
+  G.buildContextText({ vault: vaultOf(), categories: CATS, labels: [], pendingCount: 0, canPropose: true, ...over });
+
+// The bug this extraction exists to prevent.
+const readOnly = say({ canPropose: false });
+check("a read-only grant is never told to call propose_learning", !readOnly.includes("propose_learning"));
+check("a read-only grant is never told to call propose_labels", !readOnly.includes("propose_labels"));
+check("and gets no standing instructions at all", !readOnly.includes("Standing instructions"));
+check("but is told the one thing it can usefully say", readOnly.includes("add facts themselves at /vault"));
+
+const proposer = say();
+check("a proposing grant does get the standing instructions", proposer.includes("Standing instructions"));
+check("and the supersession rule that stops duplicate corrections", proposer.includes('pass that entry\'s id as "replaces"'));
+check("and the gap scan before the conversation ends", proposer.includes("gap scan"));
+
+// The onboarding offer, at its boundary.
+check("an empty vault gets the onboarding offer", proposer.includes("nearly empty"));
+check("the offer asks first rather than acting", proposer.includes("Ask first"));
+const four = vaultOf(CATS.slice(0, 4).map((c) => [c, "a fact"]));
+const five = vaultOf([...CATS.slice(0, 4).map((c) => [c, "a fact"]), ["work", "another"]]);
+check("four entries still counts as nearly empty", say({ vault: four }).includes("nearly empty"));
+check("five does not", !say({ vault: five }).includes("nearly empty"));
+check("a pending proposal means they are not new — no offer", !say({ pendingCount: 1 }).includes("nearly empty"));
+check("countEntries counts base and learned across categories", G.countEntries(five) === 5);
+
+// Everything else the response carries.
+check("freshness is always reported", proposer.includes("Section freshness"));
+check("labels in use are listed with counts", say({ labels: [{ label: "work-only", count: 3 }] }).includes("work-only (3)"));
+check("asking for a label nobody uses says so plainly", say({ askedLabel: "ghost", labels: [] }).includes('no entries carry the label "ghost"'));
+check("an existing label is not reported as missing", !say({ askedLabel: "work-only", labels: [{ label: "work-only", count: 3 }] }).includes("no entries carry"));
+check("a waiting queue is surfaced to the user", say({ pendingCount: 3 }).includes("3 proposed learnings await"));
+check("and reads as singular when it is one", say({ pendingCount: 1 }).includes("1 proposed learning awaits"));
+check("an empty queue is not mentioned", !say().includes("await"));
+
 await kv.put("audit:fay", JSON.stringify([
   { at: ago(2), client: "Claude", action: "read", detail: "identity", seq: 2, hash: "h2", prev: "h1" },
   { at: ago(3), client: "Helix (owner)", action: "write", detail: "approved", seq: 1, hash: "h1", prev: "" },

@@ -2876,6 +2876,10 @@ export * as labels from "./labels";
 export * as toolsig from "./toolsig";
 export * as pairing from "./pairing";
 export * as activity from "./activity";
+// The get_context response text. Pure, and re-exported here because index.ts
+// imports cloudflare:workers and can't be loaded by the suite — which is
+// exactly how a scope bug survived a whole version in it.
+export * as guidance from "./guidance";
 export { compileError as compileErrorForTest } from "./voice";
 export { runBackup } from "./backup";
 export default app;

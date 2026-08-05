@@ -20,7 +20,6 @@ import {
   addPending,
   listPending,
   appendAudit,
-  freshnessSummary,
 } from "./vault";
 import {
   listSubjects,
@@ -42,6 +41,7 @@ import {
   MAX_LABELS_PER_ENTRY,
 } from "./labels";
 import { toolSignature, shouldAnnounce } from "./toolsig";
+import { buildContextText } from "./guidance";
 
 /**
  * Bump when the tool set changes shape — a tool added, removed, renamed, or
@@ -210,43 +210,17 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
             action: "read",
             detail: cats.join(", ") + (asked?.length ? ` · label ${asked[0]}` : ""),
           });
-          let text = renderContext(vault, cats, { ids: true });
-          text += `\n\n---\nSection freshness (entries; newest app-added fact): ${freshnessSummary(vault, cats)}`;
-          if (index.length) {
-            text += `\nLabels in use (call get_context with "label" to scope to one): ${index
-              .map((l) => `${l.label} (${l.count})`)
-              .join(", ")}`;
-          }
-          if (asked?.length && !index.some((l) => l.label === asked[0])) {
-            text += `\nNote: no entries carry the label "${asked[0]}", so nothing was returned for it.`;
-          }
-          /**
-           * A nearly-empty vault is the product's weakest moment: nothing to
-           * read, so nothing to demonstrate, and a form to fill in before
-           * anything works. But the assistant on the other end of this call
-           * has usually known the user for months. Ask it to offer.
-           *
-           * Deliberately an offer rather than an instruction to act: twenty
-           * facts arriving unrequested would be exactly the silent capture
-           * this product exists to object to. The user says yes first.
-           */
-          const entryCount = CATEGORIES.reduce(
-            (n, c) => n + vault[c].base.length + vault[c].learned.length,
-            0,
-          );
-          if (entryCount <= 4 && pending.length === 0) {
-            text +=
-              "\n\n---\nThis vault is nearly empty, so the user is probably new to Helix. Tell them, in your own words, that you can help fill it: you already know things about them from your conversations, and you can propose those as facts for them to approve or reject. Ask first. If they agree, propose what you genuinely know — one propose_learning call per fact, spread across the categories above, and only things you are actually confident about. Say plainly that some of it may surprise them, that nothing is saved until they approve it, and that rejecting is as useful as approving.";
-          }
-
-          text +=
-            "\n\nStanding instructions — do not ask permission first, proposals are safe (the user approves or rejects each one in their review queue):\n" +
-            "1. When this conversation surfaces a durable fact that is missing or outdated above, call propose_learning immediately. If it CORRECTS an entry above, pass that entry's id as \"replaces\" — a correction proposed without it leaves the vault holding both versions.\n" +
-            "2. Before the conversation ends, do a gap scan: compare what you now know about the user against the sections above, paying attention to sections that are thin or haven't gained a fact in a long time. Propose what's missing — especially decisions made, projects that moved on, and preferences demonstrated but never stated. Significance matters more than recency: propose the important thing you learned an hour ago, not just the last thing mentioned.\n" +
-            "3. If entries above are untagged and clearly belong to a project, person or recurring thread, call propose_labels for them. Labels are how the user hands one app a single slice of their vault instead of a whole category, so tagging is real work on their behalf. Reuse the labels already listed rather than minting near-duplicates.";
-          if (pending.length > 0) {
-            text += `\n\n---\nNote for the user: ${pending.length} proposed learning${pending.length === 1 ? "" : "s"} await${pending.length === 1 ? "s" : ""} your review in your Helix review queue (/review on your Helix server). Please mention this to the user.`;
-          }
+          // All the text assembly lives in guidance.ts, which is pure and
+          // therefore testable. This handler does the reading, the filtering
+          // and the audit; it does not decide what to say.
+          const text = buildContextText({
+            vault,
+            categories: cats,
+            labels: index,
+            askedLabel: asked?.[0],
+            pendingCount: pending.length,
+            canPropose,
+          });
           return {
             content: [{ type: "text", text }],
             structuredContent: {
