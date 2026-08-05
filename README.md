@@ -118,7 +118,7 @@ An implementation that breaks one of these isn't Helix:
 
 ## Licence
 
-Copyright © 2026 James Rhodes. Licensed under AGPL-3.0-only; see `LICENSE`.
+Copyright © 2026 TestCode, Inc. Licensed under AGPL-3.0-only; see `LICENSE`.
 
 Running a vault for yourself, your family or your company triggers no
 obligation. Running a *modified* Helix as a service for other people means
