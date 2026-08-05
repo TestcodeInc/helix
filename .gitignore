@@ -1,4 +1,19 @@
 node_modules/
-.dev.vars
-.wrangler/
 dist/
+
+# Secrets. .dev.vars is wrangler's; the rest are listed because this tree gets
+# published to a public repo and the cost of one mistake here is asymmetric.
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+
+# Local state, useful to nobody else
+.wrangler/
+*.log
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
