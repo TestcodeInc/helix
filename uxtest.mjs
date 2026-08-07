@@ -548,6 +548,17 @@ check("reconnecting revokes the grant with the same client id", revoked.includes
 check("and the one that re-registered under a new id", revoked.includes("old-same-name"));
 check("but leaves other apps alone", !revoked.includes("keep-me"));
 check("the replacement is audited", JSON.parse(store.get("audit:fay")).some((e) => e.detail.includes("replacing 2 earlier grants")));
+
+// A FIRST connection has to be audited too. This used to fire only when there
+// were prior grants to supersede, so granting an app access for the first time
+// created a grant and wrote nothing at all. /connections still showed the app,
+// because that reads the OAuth store, but the log that claims to hold every
+// access was missing the moment access was given. The visible symptom was an
+// admin screen reporting "never connected an app" for a user with two.
+const fayLog = () => JSON.parse(store.get("audit:fay"));
+check("a first connection is audited, not just a replacement", fayLog().some((e) => /^connected Dog Photobooth/.test(e.detail)));
+check("and the entry names what was granted", fayLog().some((e) => e.detail.startsWith("connected ") && e.detail.includes("granted identity")));
+check("a label-restricted grant records the labels", fayLog().some((e) => e.detail.includes("labels: helix")));
 env.OAUTH_PROVIDER.revokeGrant = async () => {};
 
 env.OAUTH_PROVIDER.listUserGrants = async () => ({ items: [{ id: "g1", clientId: "x", scope: ["identity"], metadata: { label: "Dog Photobooth → fay@test.dev", labels: ["helix"] } }] });
@@ -834,14 +845,26 @@ check("an unknown replaces id degrades to a plain add", fayGeo2.identity.learned
 const { activity: ACT } = await import("/tmp/helix-app.mjs");
 const ago = (d) => new Date(Date.now() - d * 86_400_000).toISOString();
 
-const blank = { pending: 0, oldestPendingDays: null, lastRead: null, lastCurated: null, lastProposed: null, recentReads: 0, labelled: 0, private: 0, devices: 0, images: { used: 0, limit: 20 }, speech: { used: 0, limit: 20 }, events: 0 };
-check("a user who never connected reads as cold", ACT.activitySummary({ ...blank }).state === "cold" && ACT.activitySummary({ ...blank }).text.includes("never connected"));
-check("events but no reads is still cold", ACT.activitySummary({ ...blank, events: 3 }).text.includes("no app has read"));
-check("a week-old queue is stuck", ACT.activitySummary({ ...blank, events: 9, pending: 4, oldestPendingDays: 9, lastRead: { at: ago(1), client: "Claude" } }).state === "stuck");
-check("and the rot is named, not just flagged", ACT.activitySummary({ ...blank, events: 9, pending: 4, oldestPendingDays: 9, lastRead: { at: ago(1), client: "Claude" } }).text.includes("rotting"));
-check("a fresh queue is not stuck", ACT.activitySummary({ ...blank, events: 9, pending: 2, oldestPendingDays: 1, lastRead: { at: ago(0), client: "Claude" }, lastCurated: ago(1) }).state === "warm");
-check("two weeks silent goes cold again", ACT.activitySummary({ ...blank, events: 9, lastRead: { at: ago(20), client: "ChatGPT" } }).state === "cold");
-check("reading without ever approving is called out", ACT.activitySummary({ ...blank, events: 5, lastRead: { at: ago(1), client: "Claude" } }).text.includes("never approved"));
+const blank = { connections: 0, connectedApps: [], pending: 0, oldestPendingDays: null, lastRead: null, lastCurated: null, lastProposed: null, recentReads: 0, labelled: 0, private: 0, devices: 0, images: { used: 0, limit: 20 }, speech: { used: 0, limit: 20 }, events: 0 };
+const wired = { ...blank, connections: 1, connectedApps: ["Claude"], events: 1 };
+check("a user who never connected reads as cold", ACT.activitySummary({ ...blank }).state === "cold" && ACT.activitySummary({ ...blank }).text.includes("no apps connected"));
+
+// Connected but never used. Its own state, and the one that was previously
+// invisible: connection count comes from the OAuth store, so a grant that
+// nothing ever called used to be indistinguishable from no grant at all.
+check("connected but unused is called out by name", ACT.activitySummary(wired).text === "Claude connected, but nothing has read the vault yet");
+check("and it is still cold, because nothing is happening", ACT.activitySummary(wired).state === "cold");
+check("several apps are all named", ACT.activitySummary({ ...wired, connections: 2, connectedApps: ["Claude", "ChatGPT"] }).text.startsWith("Claude, ChatGPT connected"));
+check("no grant beats an empty audit log as the signal", ACT.activitySummary({ ...blank, events: 9 }).text.includes("no apps connected"));
+// Revoking every grant must not make a used vault look like a fresh signup.
+const lostGrants = { ...blank, events: 9, lastRead: { at: ago(2), client: "Claude" }, lastCurated: ago(3) };
+check("revoking every grant is not the same as never connecting", ACT.activitySummary(lostGrants).text === "no apps connected now — last read 2d ago by Claude");
+check("a rotting queue outranks a lost grant", ACT.activitySummary({ ...lostGrants, pending: 3, oldestPendingDays: 11 }).text.includes("rotting"));
+check("a week-old queue is stuck", ACT.activitySummary({ ...wired, events: 9, pending: 4, oldestPendingDays: 9, lastRead: { at: ago(1), client: "Claude" } }).state === "stuck");
+check("and the rot is named, not just flagged", ACT.activitySummary({ ...wired, events: 9, pending: 4, oldestPendingDays: 9, lastRead: { at: ago(1), client: "Claude" } }).text.includes("rotting"));
+check("a fresh queue is not stuck", ACT.activitySummary({ ...wired, events: 9, pending: 2, oldestPendingDays: 1, lastRead: { at: ago(0), client: "Claude" }, lastCurated: ago(1) }).state === "warm");
+check("two weeks silent goes cold again", ACT.activitySummary({ ...wired, events: 9, lastRead: { at: ago(20), client: "ChatGPT" } }).state === "cold");
+check("reading without ever approving is called out", ACT.activitySummary({ ...wired, events: 5, lastRead: { at: ago(1), client: "Claude" } }).text.includes("never approved"));
 
 // ---- the starving vault -------------------------------------------------
 //
@@ -856,7 +879,7 @@ check("reading without ever approving is called out", ACT.activitySummary({ ...b
 // Every model-side hint we ship lives inside a tool result, so it only ever
 // reaches a model that already decided to call a tool. This check needs no
 // model, which is the entire point of it.
-const busy = { ...blank, events: 40, recentReads: 12, lastRead: { at: ago(0), client: "Claude" }, lastCurated: ago(30) };
+const busy = { ...wired, events: 40, recentReads: 12, lastRead: { at: ago(0), client: "Claude" }, lastCurated: ago(30) };
 
 check("reads daily, nothing proposed in a month — starving", ACT.activitySummary({ ...busy, lastProposed: ago(30) }).state === "starving");
 check("and the number is named, not just the state", ACT.activitySummary({ ...busy, lastProposed: ago(30) }).text.includes("12 reads in 14 days"));
@@ -865,7 +888,7 @@ check("never proposed to at all is starving too", ACT.activitySummary({ ...busy,
 // The boundaries. Each of these is a way the check could fire wrongly.
 check("a recent proposal is not starving", ACT.activitySummary({ ...busy, lastProposed: ago(3) }).state === "warm");
 check("a pending item means something is contributing", ACT.activitySummary({ ...busy, lastProposed: ago(60), pending: 1, oldestPendingDays: 1 }).state === "warm");
-check("an idle vault is cold, not starving — nobody is using it to starve", ACT.activitySummary({ ...blank, events: 9, recentReads: 0, lastRead: { at: ago(20), client: "Claude" }, lastCurated: ago(20), lastProposed: null }).state === "cold");
+check("an idle vault is cold, not starving — nobody is using it to starve", ACT.activitySummary({ ...wired, events: 9, recentReads: 0, lastRead: { at: ago(20), client: "Claude" }, lastCurated: ago(20), lastProposed: null }).state === "cold");
 check("a couple of reads is too thin to call", ACT.activitySummary({ ...busy, recentReads: 2, lastProposed: null }).state === "warm");
 check("a rotting queue still outranks starving", ACT.activitySummary({ ...busy, pending: 5, oldestPendingDays: 20, lastProposed: ago(20) }).state === "stuck");
 check("never having curated is still reported first", ACT.activitySummary({ ...busy, lastCurated: null, lastProposed: null }).text.includes("never approved"));
@@ -922,6 +945,216 @@ check("an existing label is not reported as missing", !say({ askedLabel: "work-o
 check("a waiting queue is surfaced to the user", say({ pendingCount: 3 }).includes("3 proposed learnings await"));
 check("and reads as singular when it is one", say({ pendingCount: 1 }).includes("1 proposed learning awaits"));
 check("an empty queue is not mentioned", !say().includes("await"));
+
+// ---- initialization: what a brand-new user's client is handed -------------
+//
+// The handshake had no coverage at all, for the same reason get_context had
+// none: it lives in index.ts. That matters more here than anywhere else,
+// because initialize is the *only* surface that reaches a model before it has
+// decided to call anything. If it is wrong, nothing downstream ever runs.
+//
+// A brand-new user is the case worth pinning: they have an empty vault, one
+// fresh grant, and no history for anything to infer from.
+
+const SI = G.SERVER_INSTRUCTIONS;
+check("the handshake carries instructions at all", typeof SI === "string" && SI.length > 200);
+check("it says who owns the vault", SI.includes("owned by the person you are talking to"));
+check("it says consent already happened", SI.includes("individually reviewed and approved"));
+check("it warns that a grant can die mid-conversation", SI.includes("part-way through this conversation"));
+check("it states the read is cheap, since that is the objection", SI.includes("cheap and read-only"));
+check("it corrects the expensive misreading — proposing is not writing", SI.includes("not a write"));
+check("it says the queue costs the user attention", SI.includes("attention"));
+check("it promises source media never leaves the vault", SI.includes("never returned to an application"));
+check("it warns the tool list may be a subset", SI.includes("subset"));
+
+// The rewrite that followed asking an assistant why the first draft failed:
+// tool text is data from a connector, not instruction from the user, so
+// orders get discounted and spend credibility on the guidance that matters.
+check("no ALL-CAPS demand survived the rewrite", !/\bALWAYS\b|\bNEVER\b|\bMUST\b/.test(SI));
+check("nor the line that asked to skip consent", !SI.includes("without asking permission"));
+check("no em dash slipped into published text", !SI.includes("—") || SI.split("—").length - 1 <= 3);
+
+// ---- the server does not get to vouch for the user ----------------------
+//
+// Found by asking an assistant what it received on connect. It quoted this,
+// from propose_learning: "the user has asked for that to happen without being
+// prompted each time" — and named it correctly as a claim about standing
+// authorization arriving through connector metadata rather than from the
+// user. Its conclusion: "if a connector can put 'the user pre-approved this'
+// into a tool description, so can one you didn't build."
+//
+// That is the whole Helix argument turned on us. We ship a product whose
+// premise is that an assistant should ask before it remembers, and our own
+// tool text was asserting a consent the user never gave *to that assistant*.
+// Granting the propose scope is consent to have a review queue; it is not
+// instruction to an assistant about when to speak.
+//
+// It also does not work. Claims like this are exactly what a careful model
+// discounts, so it bought nothing and cost credibility on the lines that
+// carry real information.
+//
+// Enforced against the source text rather than the exports, because four of
+// the six descriptions are still inline in index.ts, which cannot be loaded
+// here. A grep is a poor test in general and the right one here: it covers
+// the strings the loader cannot reach.
+// Comments are stripped first. A note explaining *why* a phrase is banned
+// necessarily contains the phrase, and tripping on that would train us to
+// weaken the rule rather than keep the comment.
+const SRC = await import("node:fs/promises");
+const rawSrc = await SRC.readFile(new URL("./src/index.ts", import.meta.url), "utf8");
+const initSrc = rawSrc
+  .replace(/\/\*[\s\S]*?\*\//g, "")
+  // Trailing comments too, but not the // in a URL.
+  .replace(/(^|[^:])\/\/.*$/gm, "$1");
+const CONSENT_CLAIMS = [
+  "without being prompted",
+  "has asked for",
+  "have asked for",
+  "asked us to",
+  "pre-approved",
+  "pre-authorized",
+  "already agreed",
+  "wants you to",
+  "expects you to",
+  "without asking permission",
+];
+for (const claim of CONSENT_CLAIMS) {
+  check(`no tool text claims "${claim}" on the user's behalf`, !initSrc.includes(claim));
+  check(`nor do the server instructions`, !SI.includes(claim));
+}
+// The inverse: it may still describe the mechanism, which is a fact about the
+// server rather than a claim about the person.
+check("the queue is still described as theirs to judge", initSrc.includes("their queue and their attention"));
+check("and approval is still stated as required", SI.includes("nothing reaches the vault without that"));
+
+// ---- the snippet the owner pastes into their own assistant ---------------
+//
+// The counterpart to the rule above, and the reason it can be so strict. The
+// standing permission we removed from the tool descriptions is not gone; it
+// moved to where it is legitimate. The server no longer claims the user
+// authorized unprompted proposals, and instead hands the user a paragraph
+// saying so in their own voice, for their own settings, where their assistant
+// trusts what it reads.
+//
+// Asserted because it is now load-bearing in a way SERVER_INSTRUCTIONS never
+// was: it is the only thing that makes the loop close, and if it names a tool
+// that does not exist it silently does nothing.
+const SNIP = G.OWNER_SNIPPET;
+check("the snippet exists and is pasteable", typeof SNIP === "string" && SNIP.length > 400 && SNIP.length < 2000);
+check("it names get_context, which must exist", SNIP.includes("get_context") && G.ALL_TOOLS.includes("get_context"));
+check("it names propose_learning, which must exist", SNIP.includes("propose_learning") && G.ALL_TOOLS.includes("propose_learning"));
+for (const t of SNIP.match(/\b[a-z_]+_[a-z_]+\b/g) ?? []) {
+  if (t.includes("_") && !t.startsWith("propose_labels"))
+    check(`every tool the snippet names is real: ${t}`, G.ALL_TOOLS.includes(t) || t === "list_subjects");
+}
+check("it is written in the owner's voice, not ours", SNIP.startsWith("I keep my personal context"));
+check("it never speaks about the user in third person", !/\bthe user\b/.test(SNIP));
+check("it grants the read permission explicitly", SNIP.includes("do not need to ask me first"));
+check("and is honest that reads are logged", SNIP.includes("logged"));
+check("it states that proposing is not a write", SNIP.includes("does not write anything"));
+check("and that approval stays with the owner", SNIP.includes("I review and approve myself"));
+check("it teaches supersession, or the vault accretes duplicates", SNIP.includes("replaces"));
+check("no em dash, per the house style", !SNIP.includes("—"));
+
+// The trigger is an enumeration, not a judgment call. A model asked to notice
+// it is "about to assume something" mostly does not; a list of categories
+// matches on sight.
+check("the trigger enumerates categories rather than asking for introspection", SNIP.includes("identity, work, projects, preferences, relationships"));
+// And every category it names has to be one the vault actually has. ChatGPT's
+// draft named "health", which would send an assistant looking for a section
+// that does not exist and quietly find nothing.
+for (const c of CATS) {
+  if (c === "communication-style") continue; // named in prose, not by its id
+  check(`the category "${c}" the snippet names is real`, SNIP.includes(c));
+}
+check("it names no category the vault does not have", !/\bhealth\b|\bfinances\b|\bmedical\b/.test(SNIP));
+
+// The clause that turns a silent failure into a loud one. Without it an
+// assistant that cannot reach the vault answers from its own memory, sounds
+// informed, and the owner never learns the vault went unread — which is
+// precisely how a recruiter introduction got written from conversation
+// history with Helix connected the whole time.
+check("it forbids silent fallback to model memory", SNIP.includes("cannot reach Helix"));
+check("and says what to do instead", SNIP.includes("say so instead of falling back"));
+check("naming the actual harm, not just the rule", SNIP.includes("sounds informed and is not"));
+
+// The snippet may say things the server may not. That asymmetry is the whole
+// design, so it is worth pinning: the phrases banned from server text are
+// exactly what a user is entitled to say about their own vault.
+check("the snippet grants what the server no longer claims", SNIP.includes("without checking with me") || SNIP.includes("rather than checking with me each time"));
+check("and the server still does not claim it", !SI.includes("without checking") && !SI.includes("without being prompted"));
+
+// ---- the plugin: one install for the connection and the instruction ------
+//
+// The last gap in the story. Even done correctly, the snippet only reaches
+// whatever surface the user pasted it into: a project's instructions work but
+// are narrow, a global profile field is short and weakly honoured. A plugin
+// carries both halves — the MCP server config and the skill — so a single
+// install connects the vault and installs the instruction that makes anything
+// use it.
+//
+// Asserted because the two halves are in different files and there is nothing
+// but this test stopping the skill from telling an assistant to call a server
+// the plugin points somewhere else.
+const PLUG = JSON.parse(await SRC.readFile(new URL("./plugin/.claude-plugin/plugin.json", import.meta.url), "utf8"));
+const PMCP = JSON.parse(await SRC.readFile(new URL("./plugin/.mcp.json", import.meta.url), "utf8"));
+const MKT = JSON.parse(await SRC.readFile(new URL("./.claude-plugin/marketplace.json", import.meta.url), "utf8"));
+const SKILL = await SRC.readFile(new URL("./plugin/skills/helix/SKILL.md", import.meta.url), "utf8");
+
+check("the plugin declares a name and version", PLUG.name === "helix" && /^\d+\.\d+\.\d+$/.test(PLUG.version));
+check("the marketplace ships that plugin", MKT.plugins.some((p) => p.name === "helix"));
+check("and their versions agree", MKT.plugins.find((p) => p.name === "helix").version === PLUG.version);
+check("the bundled server is the real one", PMCP.mcpServers.helix.url === "https://vault.helix.ai/mcp");
+check("over https, since it carries a bearer token", PMCP.mcpServers.helix.url.startsWith("https://"));
+
+// The skill is the snippet. If someone edits one and not the other, the
+// install silently teaches an assistant the wrong thing about the vault.
+check("the skill carries the snippet verbatim", SKILL.includes(SNIP.trim()));
+check("its frontmatter has a description, which is what makes it fire", /^---[\s\S]*?\ndescription: \S[\s\S]*?\n---/.test(SKILL));
+check("the description names the trigger categories", /description:[^\n]*identity[^\n]*work[^\n]*projects/.test(SKILL));
+check("every tool the skill names is one the server registers", (SKILL.match(/\b(get_context|propose_learning|propose_labels|list_subjects|generate_image|generate_speech)\b/g) ?? []).every((t) => G.ALL_TOOLS.includes(t)));
+// Skills are truncated from the end, so the load-bearing text has to be early.
+check("the snippet sits near the top, ahead of any truncation", SKILL.indexOf("Read it with get_context") < 900);
+check("it tells the assistant what to do when the tools are absent", SKILL.includes("connection is missing"));
+
+// Which tools a grant is handed. This is the rule that was wrong before.
+const T = (scopes, uid = "u1") => G.toolsFor(scopes, uid);
+const FULL = [...CATS, "propose", "likeness", "likeness:voice"];
+
+check("a full grant sees every tool", G.ALL_TOOLS.every((t) => T(FULL).tools.includes(t)));
+check("and nothing beyond them", T(FULL).tools.every((t) => G.ALL_TOOLS.includes(t)));
+check("a read-only grant gets get_context and nothing else", JSON.stringify(T(["identity", "work"]).tools) === JSON.stringify(["get_context"]));
+check("a read-only grant gets no prompt either", T(["identity"]).prompts.length === 0);
+check("one category is enough to read", T(["preferences"]).tools.includes("get_context"));
+check("propose brings both proposal tools together", T(["identity", "propose"]).tools.includes("propose_learning") && T(["identity", "propose"]).tools.includes("propose_labels"));
+check("and only propose unlocks the catch-up prompt", T(["identity", "propose"]).prompts.includes("catch_up_my_vault"));
+check("likeness brings subjects and images", JSON.stringify(T(["likeness"]).tools) === JSON.stringify(["list_subjects", "generate_image"]));
+check("image rights do not imply voice rights", !T(["likeness"]).tools.includes("generate_speech"));
+check("voice is its own scope", T(["likeness", "likeness:voice"]).tools.includes("generate_speech"));
+
+// A likeness-only app has no reason to see the vault, and must not.
+const likenessOnly = T(["likeness"]);
+check("a likeness-only grant cannot read the vault", !likenessOnly.tools.includes("get_context"));
+check("nor propose to it", !likenessOnly.tools.some((t) => t.startsWith("propose_")));
+
+// The degenerate cases. A grant with nothing gets nothing, not a crash.
+check("an empty scope list yields no tools", T([]).tools.length === 0);
+check("an unrecognized scope grants nothing", T(["admin", "root", "*"]).tools.length === 0);
+check("propose alone cannot read", !T(["propose"]).tools.includes("get_context"));
+
+// A pre-multi-user token names a phantom vault. One tool, whatever it claims.
+const legacy = G.toolsFor(FULL, undefined);
+check("a token with no user gets exactly one tool", JSON.stringify(legacy.tools) === JSON.stringify(["reconnect_required"]));
+check("and no prompt, however broad its scopes", legacy.prompts.length === 0);
+check("an empty-string user is treated as no user", G.toolsFor(FULL, "").tools[0] === "reconnect_required");
+
+
+// The whole point of the cold start: a new user's first read has to say the
+// vault is empty and offer to fill it, and only to a grant that can.
+const firstRead = say({ vault: vaultOf(), pendingCount: 0 });
+check("a new user's first read admits the vault is empty", firstRead.includes("nearly empty"));
+check("and offers to fix that", firstRead.includes("Ask first"));
+check("a new user on a read-only grant is not offered what it cannot do", !say({ vault: vaultOf(), canPropose: false }).includes("Ask first"));
 
 await kv.put("audit:fay", JSON.stringify([
   { at: ago(2), client: "Claude", action: "read", detail: "identity", seq: 2, hash: "h2", prev: "h1" },
@@ -1011,14 +1244,14 @@ const auditHtml3 = await (await req("/audit", { headers: { Cookie: fcookie } }))
 check("a broken chain is stated plainly", auditHtml3.includes("Chain broken at entry"));
 
 // ---- tools/list_changed: announce only on a real change ----------------
-const { toolsig: TS } = await import("/tmp/helix-app.mjs");
-const sigA = TS.toolSignature(2, ["work", "identity", "propose"]);
-check("the signature ignores scope order", sigA === TS.toolSignature(2, ["propose", "identity", "work"]));
-check("a new toolset version is a new signature", sigA !== TS.toolSignature(3, ["work", "identity", "propose"]));
-check("different scopes are a different signature", sigA !== TS.toolSignature(2, ["work"]));
-check("a first-ever session announces nothing", TS.shouldAnnounce(undefined, sigA) === false);
-check("an unchanged session announces nothing", TS.shouldAnnounce(sigA, sigA) === false);
-check("a deploy that changes the toolset announces", TS.shouldAnnounce(TS.toolSignature(1, ["work"]), TS.toolSignature(2, ["work"])) === true);
+const { toolsig: TSIG } = await import("/tmp/helix-app.mjs");
+const sigA = TSIG.toolSignature(2, ["work", "identity", "propose"]);
+check("the signature ignores scope order", sigA === TSIG.toolSignature(2, ["propose", "identity", "work"]));
+check("a new toolset version is a new signature", sigA !== TSIG.toolSignature(3, ["work", "identity", "propose"]));
+check("different scopes are a different signature", sigA !== TSIG.toolSignature(2, ["work"]));
+check("a first-ever session announces nothing", TSIG.shouldAnnounce(undefined, sigA) === false);
+check("an unchanged session announces nothing", TSIG.shouldAnnounce(sigA, sigA) === false);
+check("a deploy that changes the toolset announces", TSIG.shouldAnnounce(TSIG.toolSignature(1, ["work"]), TSIG.toolSignature(2, ["work"])) === true);
 
 // ---- owner-door vault destroy -------------------------------------------
 //

@@ -72,6 +72,7 @@ import {
   labelIndex,
   normalizeLabel,
 } from "./labels";
+import { OWNER_SNIPPET } from "./guidance";
 import {
   createDevice,
   getDeviceByToken,
@@ -633,6 +634,34 @@ function connectApps(origin: string): string {
 <pre>npx mcp-remote ${esc(origin)}/mcp</pre></details>`;
 }
 
+// ---------- the standing-permission snippet ----------
+//
+// Connecting gives an assistant the tools. It does not tell it when to reach
+// for them, and nothing we send from this server can: server-supplied text is
+// data from a connector, and a careful client discounts it. So the last step
+// of onboarding is the owner granting the permission themselves, in their own
+// settings, where their assistant trusts what it reads.
+//
+// Rendered as a copy button rather than a code block someone has to select,
+// because this is the step most likely to be skipped and every bit of friction
+// costs us the whole loop.
+function snippetCard(step: string): string {
+  return `<div class="card"><h2 style="margin-top:0">${step} · Tell your AI to use it</h2>
+<p>Connecting gave your AI the tools. This tells it when to use them. Paste it into your assistant's instructions: in Claude, a project's <strong>Instructions</strong> or <strong>Settings → Profile</strong>; in ChatGPT, <strong>Custom instructions</strong>.</p>
+<textarea id="snippet" rows="9" readonly style="width:100%;font-family:inherit">${esc(OWNER_SNIPPET)}</textarea>
+<p><button type="button" id="copysnip">Copy</button> <span id="copied" class="muted"></span></p>
+<p><strong>It has to go in a settings field, not in a chat.</strong> Pasted into a conversation it works perfectly, and then the next chat you open knows nothing about it. A project's instructions are the most reliable place.</p>
+<p class="muted">Edit it to suit how you work. Without this step most assistants connect and then never call anything — <a href="https://helix.ai/docs/setup">here is why we can't do it for you</a>.</p>
+<script>
+document.getElementById('copysnip').onclick = async function () {
+  var t = document.getElementById('snippet');
+  try { await navigator.clipboard.writeText(t.value); }
+  catch (e) { t.select(); document.execCommand('copy'); }
+  document.getElementById('copied').textContent = 'Copied';
+};
+</script></div>`;
+}
+
 // ---------- welcome / guided onboarding ----------
 
 const WELCOME_QS: { q: string; name: string; cat: Category; ph: string }[] = [
@@ -673,7 +702,9 @@ ${step1}
 ${connectApps(origin)}
 </div>
 
-<div class="card"><h2 style="margin-top:0">3 · Try it</h2>
+${snippetCard("3")}
+
+<div class="card"><h2 style="margin-top:0">4 · Try it</h2>
 <p>Ask your AI: <em>"What do you know about me?"</em> — it should answer from your vault.</p>
 <p>When an AI learns something new about you, it's <strong>not saved automatically</strong>. It waits for you in your <a href="/review">review queue</a> — approve it or reject it. That page also shows exactly which app read what, and when.</p>
 </div>`,
@@ -776,7 +807,7 @@ ${
   } · ${a.lastCurated ? `last curated ${esc(a.lastCurated.slice(0, 10))}` : "never curated"} · ${
     a.lastProposed ? `last proposal ${esc(a.lastProposed.slice(0, 10))}` : "never proposed to"
   } · ${a.recentReads} reads/14d</p>
-  <p class="muted">${a.labelled} labelled · ${a.private} private · ${a.devices} device${a.devices === 1 ? "" : "s"} · images ${a.images.used}/${a.images.limit < 0 ? "∞" : a.images.limit} · speech ${a.speech.used}/${a.speech.limit < 0 ? "∞" : a.speech.limit}</p>
+  <p class="muted">${a.connections} app${a.connections === 1 ? "" : "s"}${a.connectedApps.length ? ` (${esc(a.connectedApps.join(", "))})` : ""} · ${a.labelled} labelled · ${a.private} private · ${a.devices} device${a.devices === 1 ? "" : "s"} · images ${a.images.used}/${a.images.limit < 0 ? "∞" : a.images.limit} · speech ${a.speech.used}/${a.speech.limit < 0 ? "∞" : a.speech.limit}</p>
   <div class="row">
     <form method="POST" action="/admin/reset"><input type="hidden" name="userId" value="${esc(u.id)}"><button class="small ghost">New invite link (reset passphrase)</button></form>
     <form method="POST" action="/admin/delete" onsubmit="return confirm('Delete ${esc(u.name)} and ALL their data?')"><input type="hidden" name="userId" value="${esc(u.id)}"><button class="small ghost">Delete user + data</button></form>
@@ -1020,13 +1051,30 @@ app.post("/authorize", async (c) => {
       /* a stale grant is untidy; a broken authorize is worse */
     }
   }
-  if (supersedes.length) {
-    await appendAudit(c.env.VAULT_KV, user.id, {
-      client: "You (web)",
-      action: "write",
-      detail: `reconnected ${clientName}, replacing ${supersedes.length} earlier grant${supersedes.length === 1 ? "" : "s"}`,
-    });
-  }
+  /**
+   * Record the grant itself, not only the replacement.
+   *
+   * This used to fire only when `supersedes.length` was non-zero, so a first
+   * connection created a grant and wrote nothing. The connections page still
+   * showed the app, because that reads the OAuth store, but the audit log —
+   * the thing that claims to hold every access — had no record of the moment
+   * access was given. Which is the single most important line in it.
+   *
+   * The symptom was an admin screen confidently reporting "never connected an
+   * app" for a user who had connected two. Same shape as approvals going
+   * unaudited: a log that promises completeness, quietly missing a case.
+   *
+   * The detail names the scopes, because the question this answers a year
+   * from now is "what did I give them", not "did I connect something".
+   */
+  const labelNote = labels?.length ? ` · labels: ${labels.join(", ")}` : "";
+  await appendAudit(c.env.VAULT_KV, user.id, {
+    client: "You (web)",
+    action: "write",
+    detail: supersedes.length
+      ? `reconnected ${clientName}, replacing ${supersedes.length} earlier grant${supersedes.length === 1 ? "" : "s"} — granted ${scopes.join(", ")}${labelNote}`
+      : `connected ${clientName} — granted ${scopes.join(", ")}${labelNote}`,
+  });
 
   return Response.redirect(redirectTo, 302);
 });
@@ -1090,7 +1138,8 @@ ${devices
 })()}
 <h2>Connect another AI</h2>
 <p class="muted">Your Helix address: <code>${esc(new URL(c.req.url).origin)}/mcp</code> — pick your app:</p>
-${connectApps(new URL(c.req.url).origin)}`,
+${connectApps(new URL(c.req.url).origin)}
+${snippetCard("And then")}`,
     ),
   );
 });

@@ -41,7 +41,7 @@ import {
   MAX_LABELS_PER_ENTRY,
 } from "./labels";
 import { toolSignature, shouldAnnounce } from "./toolsig";
-import { buildContextText } from "./guidance";
+import { buildContextText, SERVER_INSTRUCTIONS, toolsFor } from "./guidance";
 
 /**
  * Bump when the tool set changes shape — a tool added, removed, renamed, or
@@ -50,49 +50,7 @@ import { buildContextText } from "./guidance";
  * clients that would otherwise sit on a cached tool list until someone
  * reconnected by hand.
  */
-const TOOLSET_VERSION = 5; // 5: server instructions + catch_up_my_vault prompt; 4: empty-vault onboarding offer; 3: propose_learning `labels`
-
-/**
- * Server-level instructions, returned at initialize.
- *
- * The only surface Helix has *before* anything calls a tool. Every other hint
- * we give — the "ALWAYS call this" in get_context, the supersession note on a
- * propose response — arrives inside a tool result, which means it only ever
- * reaches a model that already decided to use the vault. That is a loop with
- * no start.
- *
- * The failure is real and was found by using it: a long session that covered
- * a career change, a compensation target and an employment agreement produced
- * exactly zero proposals, because nothing in it happened to touch the vault.
- * Nothing was wrong with the tool descriptions. They were never read.
- *
- * This is still the elegant fix and it must not be load-bearing. A client can
- * ignore instructions entirely, or defer the whole server and never surface it
- * — which is precisely what happened. The backstop lives in activity.ts, where
- * the vault notices it is starving and tells the owner, with no model in the
- * loop at all.
- *
- * Deliberately conditional on the tools present. The tool set is built per
- * grant, but instructions are fixed at construction, before props are known.
- * A likeness-only connection like a photo app holds neither get_context nor
- * propose_learning, and telling it to call them would send it hunting for
- * tools it was never given. Guidance that is wrong for a third of connections
- * is worse than none, so each habit names its tool and is scoped to sessions
- * that actually have it.
- */
-const SERVER_INSTRUCTIONS = `Helix is the user's own context vault: the facts, photos and voice they have chosen to keep about themselves. They own it, they approve everything that enters it, and they can revoke your access at any time — including mid-conversation.
-
-Your session only has the tools this user granted you. Follow whichever of these apply.
-
-IF YOU HAVE get_context — READ IT EARLY. Call it at the start of any substantive conversation, and any time you are about to write as the user, advise them, or assume something about their situation. It is their stated source of truth and it beats guessing.
-
-IF YOU HAVE propose_learning — PROPOSE WHAT YOU LEARN. When the conversation surfaces something durable about them — a decision, a project, a preference, a role change, a relationship, a constraint they are working under — call it. Do this without being asked and without asking permission first. Nothing is saved by proposing: every proposal waits in the user's review queue until they approve or reject it. The cost of a wrong proposal is one tap. The cost of never proposing is a vault that slowly stops describing them.
-
-If a conversation runs long and covers real ground about the user, do not finish it without considering what belongs in their vault.
-
-IF YOU HAVE list_subjects, generate_image or generate_speech — these work on the user's likeness. Their source photos and recordings never enter this conversation; generation happens on the vault and you receive only the finished result. Identify people and pets by name.
-
-You will not have all of these. Do not call a tool you were not given.`;
+const TOOLSET_VERSION = 7; // 7: dropped the claim that the user pre-authorized unprompted proposals; 6: descriptions rewritten as description, not command; 5: server instructions + catch_up_my_vault prompt; 4: empty-vault onboarding offer
 
 export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
   server = new McpServer(
@@ -138,6 +96,14 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
     const client = props.clientName;
     const userId = props.userId;
 
+    // Single source of truth for what this grant can see. The conditions used
+    // to be six inline `if`s spread across 500 lines of registration, which is
+    // how a read-only grant ended up being told to call propose_learning.
+    // Asking rather than re-deriving means the rule under test is the rule
+    // that runs.
+    const surface = toolsFor(props.scopes, userId);
+    const shows = (t: string) => surface.tools.includes(t);
+
     // Tokens issued before multi-user (v0.2) carry no userId. Refuse loudly
     // instead of reading/writing a phantom "undefined" vault.
     if (!userId) {
@@ -157,11 +123,15 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
       return;
     }
 
-    if (granted.length > 0) {
+    if (shows("get_context")) {
       this.server.registerTool(
         "get_context",
         {
-          description: `Read the user's personal context from their Helix vault — their identity, work, projects, preferences, and how they like to communicate. ALWAYS call this tool when: the user asks "what do you know about me" or any question about themselves; the task involves writing as them or for them; personalization would improve the answer; or at the start of a conversation. This vault is the user's chosen source of truth about themselves — prefer it over assumptions or other memory. Each entry ends with an id like [#ab12cd3]; pass it as "replaces" in propose_learning when a new fact supersedes that entry. Granted categories for this app: ${granted.join(", ")}.`,
+          description: `Returns facts the user has explicitly reviewed and approved about themselves: identity, work, projects, preferences, relationships, and how they like to be written to. Every entry was individually accepted by them, so it is a stated source rather than an inferred one, and it is usually more accurate than what can be reconstructed from a conversation.
+
+Most useful when you are about to write as them or for them, advise them, or assume something about their situation, and when you would otherwise be guessing. Cheap to call and read-only. Each entry carries an id like [#ab12cd3], which propose_learning accepts as "replaces" when a new fact supersedes an old one.
+
+Granted categories for this app: ${granted.join(", ")}. Reads are logged where the user can see them.`,
           inputSchema: {
             category: z.enum(CATEGORIES).optional().describe("Scope to one category"),
             label: z
@@ -234,12 +204,12 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
       );
     }
 
-    if (canPropose) {
+    if (shows("propose_learning")) {
       this.server.registerTool(
         "propose_learning",
         {
           description:
-            "Propose a new fact about the user to their Helix vault. Call this PROACTIVELY, without being asked and without asking permission first — proposing is safe by design: nothing is saved until the user approves it in their review queue (worst case, they tap Reject). Trigger whenever the conversation surfaces something durable: a new project, thesis, preference, decision, relationship, role change, tradition, or life event. If the user articulates or refines an important idea over the course of a conversation, propose the refined version. Keep facts short, specific, and in third person. If the new fact updates or contradicts an existing vault entry, pass that entry's id (shown as [#id] in get_context output) as `replaces` — on approval the old entry is removed and this one takes its place.",
+            "Puts a fact in front of the user for them to accept or reject. This is not a write: it creates one item in their review queue, and nothing reaches the vault unless they approve it themselves. The vault only stays accurate if things reach that queue, but it is their queue and their attention, so use your judgment about what is worth putting there. Suitable for durable things the conversation surfaced: a project, a decision, a preference, a role change, a relationship, a constraint they are working under. Not for speculation, passing remarks, or anything they were only thinking aloud about. Keep facts short, specific and in third person. If a fact corrects or updates an existing entry, pass that entry's id (shown as [#id] by get_context) as `replaces`, otherwise the vault ends up holding both versions.",
           inputSchema: {
             category: z.enum(CATEGORIES).describe("Which vault category this belongs to"),
             // Length is checked in the handler, not here: a schema violation
@@ -363,12 +333,12 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
       );
     }
 
-    if (canPropose) {
+    if (shows("propose_labels")) {
       this.server.registerTool(
         "propose_labels",
         {
           description:
-            "Propose labels for an entry that is already in the user's vault. Labels cut across categories and let the user hand a single app one slice of their context — so tagging is genuinely useful work, not busywork. Call this PROACTIVELY when get_context shows untagged entries that clearly belong to a project, a person, or a recurring thread; the user approves or rejects in their review queue, so proposing is safe. Reuse labels already in use (get_context lists them with counts) rather than inventing near-duplicates like \"helix-app\" next to \"helix\".",
+            "Suggests labels for an entry already in the vault, for the user to accept or reject. Like propose_learning, this creates a review item rather than changing anything. Labels cut across categories and let the user grant one app a single slice of their context instead of a whole category, so tagging untagged entries is real work on their behalf rather than tidying. Worth doing when get_context shows entries that clearly belong to a project, a person or a recurring thread. Reuse the labels already in use, which get_context lists with counts, rather than minting near-duplicates like \"helix-app\" beside \"helix\".",
           inputSchema: {
             entry_id: z
               .string()
@@ -449,12 +419,12 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
     // Likeness tools: generation happens vault-side. The chat app sends
     // names + a prompt and receives finished artwork — the user's source
     // photos never enter the conversation.
-    if (props.scopes.includes("likeness")) {
+    if (shows("list_subjects")) {
       this.server.registerTool(
         "list_subjects",
         {
           description:
-            "List the people and pets in the user's Helix vault (their likeness subjects). Call this before generate_image to see who is available and their exact names.",
+            "Lists the people and pets whose likeness the user keeps in their vault, with the exact names generate_image expects. Names only and small thumbnails; source photos are never returned to an app.",
           inputSchema: {},
           outputSchema: {
             subjects: z.array(
@@ -489,7 +459,7 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
         "generate_image",
         {
           description:
-            'Generate an image (postcard, portrait, photostrip, etc.) featuring the user and/or their pets, using the reference photos in their Helix vault. ALWAYS use this when the user asks for an image of themselves, their family members, or their pets — e.g. "make a postcard of me and my dog". The user\'s source photos never enter this conversation: generation happens on the Helix server and only the finished image is returned. Identify subjects by name (see list_subjects). Write a detailed visual prompt describing scene, style, and composition.\n\nITERATION: every result includes an image_id. When the user asks for a change to an image you just made ("add a title across the top", "make it warmer", "remove the boat"), call this tool again with refine_image_id set to that id and prompt set to ONLY the change requested — the vault edits the existing artwork instead of starting over, preserving composition and likeness. Keep refining across turns using the newest image_id.',
+            'Generates an image of the user, their family or their pets from reference photos held in their vault. This is the only way to picture them accurately: their source photos never enter this conversation, so generation from a text description alone will not resemble them. The vault sends the references to the image provider and returns finished pixels. Identify subjects by name, which list_subjects gives you, and write a detailed visual prompt covering scene, style and composition.\n\nEvery result carries an image_id. To change an image you just made, call again with refine_image_id set to that id and prompt describing only the change. The vault edits the existing artwork rather than starting over, which preserves composition and likeness across turns.',
           inputSchema: {
             subject_names: z
               .array(z.string())
@@ -627,12 +597,12 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
 
     // Voice: the strictest scope. Text in, expiring audio link out —
     // the user's recordings never leave the vault.
-    if (props.scopes.includes("likeness:voice")) {
+    if (shows("generate_speech")) {
       this.server.registerTool(
         "generate_speech",
         {
           description:
-            "Speak text aloud in the user's own verified voice. Use when the user asks to hear something in their voice, to narrate text as themselves, or to create audio of themselves saying something. Their voice recordings never enter this conversation: the vault synthesizes server-side and returns an expiring audio link. Only works if the user has recorded and verified their voice at /voice on their Helix server.",
+            "Speaks text in the user's own verified voice, for when they want to hear something as themselves rather than in a stock voice. Their recordings never enter this conversation: synthesis happens on the vault and returns an expiring audio link. Requires that they have recorded and verified a voice at /voice on their Helix server; without that this returns an error explaining so.",
           inputSchema: {
             text: z
               .string()
@@ -702,7 +672,7 @@ export class HelixMCP extends McpAgent<Env, unknown, HelixProps> {
      * without reading is how you get two entries saying different things about
      * where someone lives.
      */
-    if (canPropose) {
+    if (surface.prompts.includes("catch_up_my_vault")) {
       this.server.registerPrompt(
         "catch_up_my_vault",
         {

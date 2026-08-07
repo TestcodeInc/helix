@@ -1,0 +1,13 @@
+{
+  "name": "helix",
+  "owner": { "name": "TestCode, Inc.", "url": "https://helix.ai" },
+  "plugins": [
+    {
+      "name": "helix",
+      "source": "./plugin",
+      "version": "0.7.0",
+      "description": "Your own context vault: assistants read the facts you approved, and propose new ones into a queue only you can accept.",
+      "relevance": "The user asks about their own identity, work, projects, preferences or relationships; asks an assistant to write as them or on their behalf; or wants a portable, consent-gated alternative to built-in assistant memory."
+    }
+  ]
+}

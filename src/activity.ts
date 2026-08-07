@@ -18,6 +18,15 @@ import { listDevices } from "./devices";
 import { limitsFor, usageFor } from "./usage";
 
 export interface UserActivity {
+  /**
+   * Apps currently holding a grant, read from the OAuth store rather than
+   * inferred from the audit log. Those are different questions: a grant can
+   * exist while nothing has ever used it, which is precisely the state worth
+   * spotting in a new user.
+   */
+  connections: number;
+  /** Their names, so the admin line can say who rather than how many. */
+  connectedApps: string[];
   pending: number;
   /** Days since the oldest un-reviewed proposal. The rot signal. */
   oldestPendingDays: number | null;
@@ -44,14 +53,27 @@ const days = (iso: string) => Math.floor((Date.now() - Date.parse(iso)) / 86_400
 
 export async function userActivity(env: Env, userId: string): Promise<UserActivity> {
   const kv = env.VAULT_KV;
-  const [audit, pending, labelDoc, devices, limits, usage] = await Promise.all([
+  const [audit, pending, labelDoc, devices, limits, usage, grants] = await Promise.all([
     readAudit(kv, userId),
     listPending(kv, userId),
     loadLabels(kv, userId),
     listDevices(kv, userId),
     limitsFor(env, userId),
     usageFor(kv, userId),
+    // Never worth failing the whole admin page over: if the OAuth store is
+    // unreachable we show zero connections rather than nothing at all.
+    env.OAUTH_PROVIDER.listUserGrants(userId).catch(() => ({ items: [] })),
   ]);
+
+  // The grant label is "<App> → <email>"; the app name is the half before it.
+  const connectedApps = [
+    ...new Set(
+      (grants.items ?? []).map((g) => {
+        const label = (g.metadata as { label?: string } | undefined)?.label ?? "";
+        return label.split(" → ")[0] || "unknown app";
+      }),
+    ),
+  ];
 
   // The audit log is newest-first, so the first match is the latest.
   const latest = (match: (e: AuditEntry) => boolean) => audit.find(match) ?? null;
@@ -74,6 +96,8 @@ export async function userActivity(env: Env, userId: string): Promise<UserActivi
   );
 
   return {
+    connections: connectedApps.length,
+    connectedApps,
     pending: pending.length,
     oldestPendingDays: oldest ? days(oldest) : null,
     lastRead: read ? { at: read.at, client: read.client } : null,
@@ -98,13 +122,35 @@ export function activitySummary(a: UserActivity): {
   text: string;
   state: "cold" | "warm" | "stuck" | "starving";
 } {
-  if (a.events === 0) return { text: "never connected an app", state: "cold" };
+  // Connections come from the OAuth store, so this is now a fact rather than
+  // an inference from an empty audit log — which was wrong for anyone who had
+  // connected an app that never called anything.
+  //
+  // No grant *and* no history is a cold start. No grant *with* history is a
+  // disconnection, which is a different thing: the OAuth store forgets a
+  // revoked grant, the audit log doesn't. Telling someone who used the vault
+  // for a month that they have "no apps connected yet" reads as a bug.
+  if (a.connections === 0 && !a.lastRead) return { text: "no apps connected yet", state: "cold" };
+  // Ahead of the disconnection case on purpose: a rotting queue is the one
+  // state worth acting on, and it stays true whether or not a grant survives.
   if (a.pending > 0 && (a.oldestPendingDays ?? 0) >= 7)
     return {
       text: `${a.pending} pending, oldest ${a.oldestPendingDays} days — queue is rotting`,
       state: "stuck",
     };
-  if (!a.lastRead) return { text: "no app has read the vault yet", state: "cold" };
+  if (a.connections === 0)
+    return {
+      text: `no apps connected now — last read ${days(a.lastRead!.at)}d ago by ${a.lastRead!.client}`,
+      state: "cold",
+    };
+  // Connected but never used. Its own state, because it is a different problem
+  // from never having connected: they got through consent and then nothing
+  // asked the vault for anything.
+  if (!a.lastRead)
+    return {
+      text: `${a.connectedApps.join(", ")} connected, but nothing has read the vault yet`,
+      state: "cold",
+    };
   const since = days(a.lastRead.at);
   if (since >= 14)
     return { text: `last read ${since} days ago by ${a.lastRead.client} — gone quiet`, state: "cold" };

@@ -1,0 +1,10 @@
+{
+  "name": "helix",
+  "version": "0.7.0",
+  "description": "Your own context vault. Helix holds the facts you have reviewed and approved about yourself, and lets assistants read them and propose new ones into a queue you control. Nothing is remembered about you without your say-so.",
+  "author": { "name": "TestCode, Inc.", "url": "https://helix.ai" },
+  "homepage": "https://helix.ai",
+  "repository": "https://github.com/TestcodeInc/helix",
+  "license": "AGPL-3.0",
+  "keywords": ["memory", "context", "personalization", "consent", "privacy", "mcp", "vault"]
+}
